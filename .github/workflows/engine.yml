@@ -1,0 +1,80 @@
+name: Dynamic GitOps Pipeline
+
+on:
+  push:
+    paths:
+      - '**/manifest.json'
+      - '**/main.tf'        # AGORA DISPARA SE VOCÊ CORRIGIR O TERRAFORM!
+  workflow_dispatch:        # BOTÃO PARA RODAR MANUALMENTE
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detectar Manifest e Configurar Pipeline
+        id: flow
+        run: |
+          # 1. Busca o manifesto (no arquivo alterado ou o primeiro que achar)
+          MANIFEST_PATH=$(git diff --name-only HEAD^ HEAD | grep "manifest.json" | head -n 1)
+          if [ -z "$MANIFEST_PATH" ]; then
+            MANIFEST_PATH=$(find . -name "manifest.json" -not -path "*/.*" | head -n 1 | sed 's|./||')
+          fi
+          echo "Manifesto: $MANIFEST_PATH"
+
+          # 2. Extrai a Ação
+          ACTION=$(jq -r '.action' "$MANIFEST_PATH")
+          
+          # 3. Normaliza a lista de states:
+          # Se for destroy, inverte a ordem. Transforma tudo em lista de listas para o loop.
+          if [ "$ACTION" == "destroy" ]; then
+            STAGES_JSON=$(jq -c '.states | reverse | .[] | if type == "array" then . else [.] end' "$MANIFEST_PATH")
+          else
+            STAGES_JSON=$(jq -c '.states[] | if type == "array" then . else [.] end' "$MANIFEST_PATH")
+          fi
+
+          # 4. Salva os outputs (usa Base64 para evitar quebras de linha/espaços no GitHub Actions)
+          echo "action=$ACTION" >> $GITHUB_OUTPUT
+          echo "stages_list=$(echo "$STAGES_JSON" | base64 -w 0)" >> $GITHUB_OUTPUT
+
+      - name: Configurar AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::952133486861:role/CloudManActions
+          aws-region: us-east-1
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Executar Pipeline Sequencial/Paralela
+        run: |
+          ACTION="${{ steps.flow.outputs.action }}"
+          # Decodifica a lista de estágios
+          STAGES=$(echo "${{ steps.flow.outputs.stages_list }}" | base64 -d)
+
+          # Loop linha a linha (cada linha é um grupo de execução)
+          while IFS= read -r group; do
+            if [ -z "$group" ]; then continue; fi
+            
+            # Extrai os nomes das pastas dentro do grupo
+            items=$(echo "$group" | jq -r '.[]')
+            
+            echo "::group::Executando Estágio ($ACTION): $items"
+            
+            for item in $items; do
+              (
+                echo ">>> Processando: $item"
+                terraform -chdir=$item init -backend-config="key=$item/terraform.tfstate" -reconfigure > /dev/null
+                terraform -chdir=$item $ACTION -auto-approve
+              ) & 
+            done
+
+            wait # Sincroniza o paralelismo (espera as subnets antes da próxima etapa)
+            echo "::endgroup::"
+          done <<< "$STAGES"
