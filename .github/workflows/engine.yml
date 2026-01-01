@@ -1,21 +1,18 @@
 # Arquivo: .github/workflows/engine.yml (no repositório cloudman-core)
-name: Dynamic GitOps Pipeline
+name: Dynamic GitOps Engine (Multi-Cloud)
 
 on:
-  # --- CORREÇÃO PRINCIPAL: Permite ser chamado por outro repositório ---
+  # Permite ser chamado pelos repositórios dos clientes
   workflow_call:
     inputs:
-      aws_region:
+      # Mantemos apenas inputs genéricos opcionais, pois o manifesto dita as regras
+      default_region:
         required: false
         type: string
         default: "us-east-1"
-        description: "Região da AWS para deploy"
-    secrets:
-      AWS_ROLE_ARN:
-        required: true
-        description: "ARN da Role OIDC para assumir na conta do cliente"
+        description: "Região fallback caso não esteja no manifesto"
 
-  # Gatilhos para testes manuais ou push direto no repo Core (opcional)
+  # Gatilhos manuais/diretos para testes
   workflow_dispatch:
   push:
     paths:
@@ -23,111 +20,167 @@ on:
       - '**/main.tf'
 
 permissions:
-  id-token: write   # Necessário para autenticação OIDC da AWS
-  contents: read    # Necessário para ler o código (checkout)
+  id-token: write   # CRÍTICO: Necessário para gerar tokens OIDC para AWS/GCP
+  contents: read    # Necessário para ler o código
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout do Código
+      - name: 📥 Checkout do Código
         uses: actions/checkout@v4
         with:
           fetch-depth: 2
 
-      - name: Detectar Manifest e Configurar Pipeline
-        id: flow
-        shell: bash
-        run: |
-          echo "🔍 Buscando manifest.json alterado..."
-          
-          # 1. Tenta achar no git diff (arquivo modificado no commit)
-          MANIFEST_PATH=$(git diff --name-only HEAD^ HEAD | grep "manifest.json" | head -n 1)
-          
-          # 2. Se não achou no diff, procura no diretório (fallback)
-          if [ -z "$MANIFEST_PATH" ]; then
-            MANIFEST_PATH=$(find . -name "manifest.json" -not -path "*/.*" | head -n 1 | sed 's|./||')
-          fi
-
-          if [ -z "$MANIFEST_PATH" ]; then
-            echo "❌ Nenhum manifest.json encontrado."
-            exit 1
-          fi
-
-          echo "✅ Manifesto encontrado: $MANIFEST_PATH"
-
-          # 3. Extrai a Ação (plan, apply, destroy)
-          ACTION=$(jq -r '.action' "$MANIFEST_PATH")
-          echo "action=$ACTION" >> $GITHUB_OUTPUT
-          
-          # 4. Prepara a lista de States (Pastas)
-          # Se for destroy, inverte a ordem para não quebrar dependências.
-          # Normaliza tudo para array de arrays para suportar paralelismo.
-          if [ "$ACTION" == "destroy" ]; then
-            STAGES_JSON=$(jq -c '.states | reverse | .[] | if type == "array" then . else [.] end' "$MANIFEST_PATH")
-          else
-            STAGES_JSON=$(jq -c '.states[] | if type == "array" then . else [.] end' "$MANIFEST_PATH")
-          fi
-
-          # 5. Salva em Base64 para passar para o próximo step sem quebrar linhas
-          echo "stages_list=$(echo "$STAGES_JSON" | base64 -w 0)" >> $GITHUB_OUTPUT
-
-      - name: Configurar Credenciais AWS (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          # Usa o segredo passado pelo cliente via workflow_call
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          # Usa o input passado pelo cliente (ou default us-east-1)
-          aws-region: ${{ inputs.aws_region || 'us-east-1' }}
-
-      - name: Configurar Terraform
+      - name: 🛠️ Configurar Terraform
         uses: hashicorp/setup-terraform@v3
 
-      - name: Executar Pipeline (Plan/Apply/Destroy)
+      - name: 🚀 Executar Pipeline Dinâmico (Multi-Cloud)
         shell: bash
+        env:
+          # Variáveis necessárias para a troca manual de token OIDC
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${{ secrets.GITHUB_TOKEN }} # (Injetado automaticamente pelo runner, mas reforçamos o uso)
+          DEFAULT_REGION: ${{ inputs.default_region || 'us-east-1' }}
         run: |
-          ACTION="${{ steps.flow.outputs.action }}"
-          STAGES_B64="${{ steps.flow.outputs.stages_list }}"
+          # ==============================================================================
+          # FUNÇÃO AUXILIAR: Obter Token OIDC do GitHub
+          # ==============================================================================
+          get_oidc_token() {
+            # Solicita o JWT ao provedor OIDC interno do GitHub Actions
+            # Audience 'sts.amazonaws.com' é padrão para AWS
+            local aud="sts.amazonaws.com"
+            local token_url="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${aud}"
+            
+            response=$(curl -s -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "$token_url")
+            echo $response | jq -r '.value'
+          }
+
+          # ==============================================================================
+          # 1. DETECÇÃO DO MANIFESTO
+          # ==============================================================================
+          echo "🔍 Buscando manifest.json..."
           
-          # Decodifica a lista de estágios
-          STAGES=$(echo "$STAGES_B64" | base64 -d)
+          # Tenta achar no diff ou fallback para busca no diretório
+          MANIFEST_PATH=$(git diff --name-only HEAD^ HEAD | grep "manifest.json" | head -n 1)
+          if [ -z "$MANIFEST_PATH" ]; then
+            MANIFEST_PATH=$(find . -name "manifest.json" -not -path "*/.*" | head -n 1)
+          fi
 
-          echo "🚀 Iniciando execução: Terraform $ACTION"
+          if [ -z "$MANIFEST_PATH" ]; then
+            echo "❌ Erro: Nenhum manifest.json encontrado."
+            exit 1
+          fi
+          echo "✅ Manifesto carregado: $MANIFEST_PATH"
 
-          # Loop linha a linha (cada linha é um grupo de execução)
-          while IFS= read -r group; do
-            if [ -z "$group" ]; then continue; fi
+          # ==============================================================================
+          # 2. PARSE E EXECUÇÃO
+          # ==============================================================================
+          
+          # Extrai a ação global (plan/apply/destroy)
+          ACTION=$(jq -r '.action' "$MANIFEST_PATH")
+          echo "⚡ Modo de Execução: $ACTION"
+
+          # Lê a lista de estados (pastas) a processar
+          # Nota: O jq -c garante que cada objeto venha em uma linha para o loop
+          STATES=$(jq -c '.states[]' "$MANIFEST_PATH")
+
+          # Loop por cada item/pasta definido no manifesto
+          echo "$STATES" | while read -r stage; do
             
-            # Extrai os nomes das pastas dentro do grupo (JSON Array)
-            items=$(echo "$group" | jq -r '.[]')
+            # Extrai dados do estágio atual
+            PATH_DIR=$(echo "$stage" | jq -r '.path')
+            CLOUD_ID=$(echo "$stage" | jq -r '.cloud')
             
-            echo "::group::🔄 Processando Grupo: $items"
+            echo "::group::📂 Processando: $PATH_DIR (Cloud Ref: $CLOUD_ID)"
             
-            pids=""
-            for item in $items; do
-              # Roda em subshell em background (&) para paralelismo dentro do grupo
-              (
-                echo "   📂 [$item] Inicializando..."
+            if [ ! -d "$PATH_DIR" ]; then
+               echo "⚠️  Aviso: Diretório $PATH_DIR não existe. Pulando."
+               echo "::endgroup::"
+               continue
+            fi
+
+            # Busca a configuração da nuvem correspondente no array 'clouds'
+            # Isso faz o "JOIN" entre o state e a configuração da conta
+            CLOUD_CONFIG=$(jq -c ".clouds[] | select(.id == \"$CLOUD_ID\")" "$MANIFEST_PATH")
+            
+            if [ -z "$CLOUD_CONFIG" ]; then
+              echo "❌ Erro: Configuração de nuvem '$CLOUD_ID' não encontrada no manifesto."
+              exit 1
+            fi
+
+            CLOUD_TYPE=$(echo "$CLOUD_CONFIG" | jq -r '.type')
+            IDENTIFIER=$(echo "$CLOUD_CONFIG" | jq -r '.identifier') # Ex: ARN da Role
+            REGION=$(echo "$CLOUD_CONFIG" | jq -r '.region // env.DEFAULT_REGION')
+
+            # --- LÓGICA DE LOGIN MULTI-CLOUD ---
+            echo "🔑 Autenticando em: $CLOUD_TYPE ($IDENTIFIER) na região $REGION"
+
+            # Limpa credenciais anteriores para garantir isolamento
+            unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION
+
+            case $CLOUD_TYPE in
+              aws)
+                # 1. Pega o token OIDC do GitHub
+                JWT_TOKEN=$(get_oidc_token)
                 
-                # Init reconfigurando backend baseado na pasta
-                terraform -chdir=$item init -backend-config="key=$item/terraform.tfstate" -reconfigure -input=false > /dev/null
-                
-                echo "   ⚡ [$item] Executando $ACTION..."
-                if [ "$ACTION" == "plan" ]; then
-                   terraform -chdir=$item plan -input=false
-                else
-                   terraform -chdir=$item $ACTION -auto-approve -input=false
+                if [ "$JWT_TOKEN" == "null" ] || [ -z "$JWT_TOKEN" ]; then
+                   echo "❌ Falha ao obter token OIDC do GitHub."
+                   exit 1
                 fi
-              ) &
-              
-              # Armazena o ID do processo para esperar depois
-              pids="$pids $!"
-            done
 
-            # Espera todos os processos desse grupo terminarem antes de ir para o próximo
-            wait $pids
-            echo "::endgroup::"
+                # 2. Assume a Role na AWS via CLI (usando o token)
+                CREDS_JSON=$(aws sts assume-role-with-web-identity \
+                  --role-arn "$IDENTIFIER" \
+                  --role-session-name "CloudManSession-$GITHUB_RUN_ID" \
+                  --web-identity-token "$JWT_TOKEN" \
+                  --duration-seconds 900 \
+                  --output json)
+
+                if [ $? -ne 0 ]; then
+                   echo "❌ Falha ao assumir role AWS ($IDENTIFIER)."
+                   exit 1
+                fi
+
+                # 3. Exporta as credenciais para a sessão atual do Shell
+                export AWS_ACCESS_KEY_ID=$(echo $CREDS_JSON | jq -r '.Credentials.AccessKeyId')
+                export AWS_SECRET_ACCESS_KEY=$(echo $CREDS_JSON | jq -r '.Credentials.SecretAccessKey')
+                export AWS_SESSION_TOKEN=$(echo $CREDS_JSON | jq -r '.Credentials.SessionToken')
+                export AWS_REGION="$REGION"
+                ;;
+
+              # Futuros providers (GCP, Azure) entrariam aqui...
+              *)
+                echo "❌ Provider '$CLOUD_TYPE' não suportado ainda."
+                exit 1
+                ;;
+            esac
+
+            # --- EXECUÇÃO DO TERRAFORM ---
+            echo "🏗️  Executando Terraform $ACTION..."
             
-          done <<< "$STAGES"
-          
-          echo "✅ Pipeline finalizado com sucesso."
+            (
+              cd "$PATH_DIR"
+              
+              # Init: Reconfigura o backend (S3) usando as credenciais que acabamos de assumir
+              # Assumimos que o bucket do backend está na mesma conta da Role assumida
+              terraform init -reconfigure -input=false
+              
+              if [ "$ACTION" == "plan" ]; then
+                terraform plan -input=false
+              elif [ "$ACTION" == "apply" ]; then
+                terraform apply -auto-approve -input=false
+              elif [ "$ACTION" == "destroy" ]; then
+                terraform destroy -auto-approve -input=false
+              fi
+            )
+            
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -ne 0 ]; then
+               echo "❌ Falha na execução do Terraform em $PATH_DIR"
+               exit $EXIT_CODE
+            fi
+
+            echo "::endgroup::"
+          done
+
+          echo "✅ Pipeline Multi-Cloud finalizado com sucesso."
