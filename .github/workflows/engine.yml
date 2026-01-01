@@ -1,18 +1,17 @@
 # Arquivo: .github/workflows/engine.yml (no repositório cloudman-core)
-name: Dynamic GitOps Engine (Multi-Cloud)
+name: Dynamic GitOps Engine (Simplified)
 
 on:
   # Permite ser chamado pelos repositórios dos clientes
   workflow_call:
     inputs:
-      # Mantemos apenas inputs genéricos opcionais, pois o manifesto dita as regras
       default_region:
         required: false
         type: string
         default: "us-east-1"
-        description: "Região fallback caso não esteja no manifesto"
+        description: "Região padrão para autenticação AWS CLI"
 
-  # Gatilhos manuais/diretos para testes
+  # Gatilhos para testes manuais
   workflow_dispatch:
   push:
     paths:
@@ -20,7 +19,7 @@ on:
       - '**/main.tf'
 
 permissions:
-  id-token: write   # CRÍTICO: Necessário para gerar tokens OIDC para AWS/GCP
+  id-token: write   # CRÍTICO: Necessário para gerar tokens OIDC
   contents: read    # Necessário para ler o código
 
 jobs:
@@ -35,22 +34,19 @@ jobs:
       - name: 🛠️ Configurar Terraform
         uses: hashicorp/setup-terraform@v3
 
-      - name: 🚀 Executar Pipeline Dinâmico (Multi-Cloud)
+      - name: 🚀 Executar Pipeline Dinâmico
         shell: bash
         env:
-          # Variáveis necessárias para a troca manual de token OIDC
-          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${{ secrets.GITHUB_TOKEN }} # (Injetado automaticamente pelo runner, mas reforçamos o uso)
-          DEFAULT_REGION: ${{ inputs.default_region || 'us-east-1' }}
+          # Token injetado automaticamente pelo GitHub, necessário para o OIDC manual
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LOGIN_REGION: ${{ inputs.default_region || 'us-east-1' }}
         run: |
           # ==============================================================================
           # FUNÇÃO AUXILIAR: Obter Token OIDC do GitHub
           # ==============================================================================
           get_oidc_token() {
-            # Solicita o JWT ao provedor OIDC interno do GitHub Actions
-            # Audience 'sts.amazonaws.com' é padrão para AWS
             local aud="sts.amazonaws.com"
             local token_url="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${aud}"
-            
             response=$(curl -s -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "$token_url")
             echo $response | jq -r '.value'
           }
@@ -60,7 +56,6 @@ jobs:
           # ==============================================================================
           echo "🔍 Buscando manifest.json..."
           
-          # Tenta achar no diff ou fallback para busca no diretório
           MANIFEST_PATH=$(git diff --name-only HEAD^ HEAD | grep "manifest.json" | head -n 1)
           if [ -z "$MANIFEST_PATH" ]; then
             MANIFEST_PATH=$(find . -name "manifest.json" -not -path "*/.*" | head -n 1)
@@ -73,25 +68,25 @@ jobs:
           echo "✅ Manifesto carregado: $MANIFEST_PATH"
 
           # ==============================================================================
-          # 2. PARSE E EXECUÇÃO
+          # 2. LEITURA E EXECUÇÃO (Loop Simplificado)
           # ==============================================================================
           
-          # Extrai a ação global (plan/apply/destroy)
+          # Extrai a ação global
           ACTION=$(jq -r '.action' "$MANIFEST_PATH")
           echo "⚡ Modo de Execução: $ACTION"
 
-          # Lê a lista de estados (pastas) a processar
-          # Nota: O jq -c garante que cada objeto venha em uma linha para o loop
+          # Lê a lista de estados (pastas)
           STATES=$(jq -c '.states[]' "$MANIFEST_PATH")
 
-          # Loop por cada item/pasta definido no manifesto
+          # Loop por cada item do manifesto
           echo "$STATES" | while read -r stage; do
             
-            # Extrai dados do estágio atual
+            # --- LEITURA DIRETA DOS DADOS (Novo Formato) ---
             PATH_DIR=$(echo "$stage" | jq -r '.path')
-            CLOUD_ID=$(echo "$stage" | jq -r '.cloud')
+            CLOUD_TYPE=$(echo "$stage" | jq -r '.type')
+            IDENTIFIER=$(echo "$stage" | jq -r '.identifier') # Ex: ARN da Role
             
-            echo "::group::📂 Processando: $PATH_DIR (Cloud Ref: $CLOUD_ID)"
+            echo "::group::📂 Processando: $PATH_DIR"
             
             if [ ! -d "$PATH_DIR" ]; then
                echo "⚠️  Aviso: Diretório $PATH_DIR não existe. Pulando."
@@ -99,58 +94,48 @@ jobs:
                continue
             fi
 
-            # Busca a configuração da nuvem correspondente no array 'clouds'
-            # Isso faz o "JOIN" entre o state e a configuração da conta
-            CLOUD_CONFIG=$(jq -c ".clouds[] | select(.id == \"$CLOUD_ID\")" "$MANIFEST_PATH")
-            
-            if [ -z "$CLOUD_CONFIG" ]; then
-              echo "❌ Erro: Configuração de nuvem '$CLOUD_ID' não encontrada no manifesto."
-              exit 1
-            fi
+            # --- AUTENTICAÇÃO DINÂMICA (Just-in-Time) ---
+            echo "🔑 Autenticando em: $CLOUD_TYPE ($IDENTIFIER)"
 
-            CLOUD_TYPE=$(echo "$CLOUD_CONFIG" | jq -r '.type')
-            IDENTIFIER=$(echo "$CLOUD_CONFIG" | jq -r '.identifier') # Ex: ARN da Role
-            REGION=$(echo "$CLOUD_CONFIG" | jq -r '.region // env.DEFAULT_REGION')
-
-            # --- LÓGICA DE LOGIN MULTI-CLOUD ---
-            echo "🔑 Autenticando em: $CLOUD_TYPE ($IDENTIFIER) na região $REGION"
-
-            # Limpa credenciais anteriores para garantir isolamento
+            # Limpa credenciais da iteração anterior
             unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION
 
             case $CLOUD_TYPE in
               aws)
-                # 1. Pega o token OIDC do GitHub
+                # 1. Obter Token OIDC
                 JWT_TOKEN=$(get_oidc_token)
                 
                 if [ "$JWT_TOKEN" == "null" ] || [ -z "$JWT_TOKEN" ]; then
-                   echo "❌ Falha ao obter token OIDC do GitHub."
+                   echo "❌ Falha ao obter token OIDC."
                    exit 1
                 fi
 
-                # 2. Assume a Role na AWS via CLI (usando o token)
+                # 2. Assumir Role na AWS
+                # Usamos a região padrão apenas para conseguir conectar no STS
                 CREDS_JSON=$(aws sts assume-role-with-web-identity \
                   --role-arn "$IDENTIFIER" \
                   --role-session-name "CloudManSession-$GITHUB_RUN_ID" \
                   --web-identity-token "$JWT_TOKEN" \
                   --duration-seconds 900 \
+                  --region "$LOGIN_REGION" \
                   --output json)
 
                 if [ $? -ne 0 ]; then
-                   echo "❌ Falha ao assumir role AWS ($IDENTIFIER)."
+                   echo "❌ Falha ao assumir role ($IDENTIFIER)."
                    exit 1
                 fi
 
-                # 3. Exporta as credenciais para a sessão atual do Shell
+                # 3. Exportar Credenciais
                 export AWS_ACCESS_KEY_ID=$(echo $CREDS_JSON | jq -r '.Credentials.AccessKeyId')
                 export AWS_SECRET_ACCESS_KEY=$(echo $CREDS_JSON | jq -r '.Credentials.SecretAccessKey')
                 export AWS_SESSION_TOKEN=$(echo $CREDS_JSON | jq -r '.Credentials.SessionToken')
-                export AWS_REGION="$REGION"
+                
+                # Região para a sessão (Terraform provider sobrescreverá isso se necessário)
+                export AWS_REGION="$LOGIN_REGION"
                 ;;
 
-              # Futuros providers (GCP, Azure) entrariam aqui...
               *)
-                echo "❌ Provider '$CLOUD_TYPE' não suportado ainda."
+                echo "❌ Provider '$CLOUD_TYPE' não suportado."
                 exit 1
                 ;;
             esac
@@ -161,8 +146,7 @@ jobs:
             (
               cd "$PATH_DIR"
               
-              # Init: Reconfigura o backend (S3) usando as credenciais que acabamos de assumir
-              # Assumimos que o bucket do backend está na mesma conta da Role assumida
+              # Init: Reconfigura o backend
               terraform init -reconfigure -input=false
               
               if [ "$ACTION" == "plan" ]; then
@@ -183,4 +167,4 @@ jobs:
             echo "::endgroup::"
           done
 
-          echo "✅ Pipeline Multi-Cloud finalizado com sucesso."
+          echo "✅ Pipeline finalizado com sucesso."
