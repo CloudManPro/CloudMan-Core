@@ -1,170 +1,143 @@
-# Arquivo: .github/workflows/engine.yml (no repositório cloudman-core)
-name: Dynamic GitOps Engine (Simplified)
+#!/bin/bash
 
-on:
-  # Permite ser chamado pelos repositórios dos clientes
-  workflow_call:
-    inputs:
-      default_region:
-        required: false
-        type: string
-        default: "us-east-1"
-        description: "Região padrão para autenticação AWS CLI"
+# Configurações Visuais
+BOLD='\033[1m'
+BLUE='\033[0;34m'
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+NC='\033[0m'
+mkdir -p logs
 
-  # Gatilhos para testes manuais
-  workflow_dispatch:
-  push:
-    paths:
-      - '**/manifest.json'
-      - '**/main.tf'
+# Variáveis Globais de Cache de Sessão (Para execução sequencial)
+CURRENT_TARGET_ID=""
+CURRENT_TARGET_REGION=""
 
-permissions:
-  id-token: write   # CRÍTICO: Necessário para gerar tokens OIDC
-  contents: read    # Necessário para ler o código
+# ==============================================================================
+# FUNÇÃO: Autenticação Inteligente (Com Cache)
+# ==============================================================================
+authenticate_target() {
+    local provider=$1
+    local auth_json=$2
+    local is_parallel=$3 # Se for paralelo, FORÇA re-autenticação isolada
 
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - name: 📥 Checkout do Código
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
-
-      - name: 🛠️ Configurar Terraform
-        uses: hashicorp/setup-terraform@v3
-
-      - name: 🚀 Executar Pipeline Dinâmico
-        shell: bash
-        env:
-          # Token injetado automaticamente pelo GitHub, necessário para o OIDC manual
-          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          LOGIN_REGION: ${{ inputs.default_region || 'us-east-1' }}
-        run: |
-          # ==============================================================================
-          # FUNÇÃO AUXILIAR: Obter Token OIDC do GitHub
-          # ==============================================================================
-          get_oidc_token() {
-            local aud="sts.amazonaws.com"
-            local token_url="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${aud}"
-            response=$(curl -s -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "$token_url")
-            echo $response | jq -r '.value'
-          }
-
-          # ==============================================================================
-          # 1. DETECÇÃO DO MANIFESTO
-          # ==============================================================================
-          echo "🔍 Buscando manifest.json..."
-          
-          MANIFEST_PATH=$(git diff --name-only HEAD^ HEAD | grep "manifest.json" | head -n 1)
-          if [ -z "$MANIFEST_PATH" ]; then
-            MANIFEST_PATH=$(find . -name "manifest.json" -not -path "*/.*" | head -n 1)
-          fi
-
-          if [ -z "$MANIFEST_PATH" ]; then
-            echo "❌ Erro: Nenhum manifest.json encontrado."
-            exit 1
-          fi
-          echo "✅ Manifesto carregado: $MANIFEST_PATH"
-
-          # ==============================================================================
-          # 2. LEITURA E EXECUÇÃO (Loop Simplificado)
-          # ==============================================================================
-          
-          # Extrai a ação global
-          ACTION=$(jq -r '.action' "$MANIFEST_PATH")
-          echo "⚡ Modo de Execução: $ACTION"
-
-          # Lê a lista de estados (pastas)
-          STATES=$(jq -c '.states[]' "$MANIFEST_PATH")
-
-          # Loop por cada item do manifesto
-          echo "$STATES" | while read -r stage; do
+    # Se for paralelo, não podemos usar cache global (variáveis de ambiente conflitariam)
+    if [ "$is_parallel" == "true" ]; then
+        # Lógica de auth isolada (subshell) já é garantida pelo encapsulamento da função run_terraform
+        # Apenas executa o login normalmente
+        : 
+    else
+        # Se for sequencial, tenta usar o cache
+        if [ "$provider" == "aws" ]; then
+            local role=$(echo "$auth_json" | jq -r '.role_arn')
+            local region=$(echo "$auth_json" | jq -r '.region')
             
-            # --- LEITURA DIRETA DOS DADOS (Novo Formato) ---
-            PATH_DIR=$(echo "$stage" | jq -r '.path')
-            CLOUD_TYPE=$(echo "$stage" | jq -r '.type')
-            IDENTIFIER=$(echo "$stage" | jq -r '.identifier') # Ex: ARN da Role
-            
-            echo "::group::📂 Processando: $PATH_DIR"
-            
-            if [ ! -d "$PATH_DIR" ]; then
-               echo "⚠️  Aviso: Diretório $PATH_DIR não existe. Pulando."
-               echo "::endgroup::"
-               continue
+            # Check de Cache
+            if [ "$role" == "$CURRENT_TARGET_ID" ] && [ "$region" == "$CURRENT_TARGET_REGION" ]; then
+                echo "⚡ [Auth] Reutilizando sessão AWS existente ($role)..."
+                return
             fi
 
-            # --- AUTENTICAÇÃO DINÂMICA (Just-in-Time) ---
-            echo "🔑 Autenticando em: $CLOUD_TYPE ($IDENTIFIER)"
-
-            # Limpa credenciais da iteração anterior
-            unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION
-
-            case $CLOUD_TYPE in
-              aws)
-                # 1. Obter Token OIDC
-                JWT_TOKEN=$(get_oidc_token)
-                
-                if [ "$JWT_TOKEN" == "null" ] || [ -z "$JWT_TOKEN" ]; then
-                   echo "❌ Falha ao obter token OIDC."
-                   exit 1
-                fi
-
-                # 2. Assumir Role na AWS
-                # Usamos a região padrão apenas para conseguir conectar no STS
-                CREDS_JSON=$(aws sts assume-role-with-web-identity \
-                  --role-arn "$IDENTIFIER" \
-                  --role-session-name "CloudManSession-$GITHUB_RUN_ID" \
-                  --web-identity-token "$JWT_TOKEN" \
-                  --duration-seconds 900 \
-                  --region "$LOGIN_REGION" \
-                  --output json)
-
-                if [ $? -ne 0 ]; then
-                   echo "❌ Falha ao assumir role ($IDENTIFIER)."
-                   exit 1
-                fi
-
-                # 3. Exportar Credenciais
-                export AWS_ACCESS_KEY_ID=$(echo $CREDS_JSON | jq -r '.Credentials.AccessKeyId')
-                export AWS_SECRET_ACCESS_KEY=$(echo $CREDS_JSON | jq -r '.Credentials.SecretAccessKey')
-                export AWS_SESSION_TOKEN=$(echo $CREDS_JSON | jq -r '.Credentials.SessionToken')
-                
-                # Região para a sessão (Terraform provider sobrescreverá isso se necessário)
-                export AWS_REGION="$LOGIN_REGION"
-                ;;
-
-              *)
-                echo "❌ Provider '$CLOUD_TYPE' não suportado."
-                exit 1
-                ;;
-            esac
-
-            # --- EXECUÇÃO DO TERRAFORM ---
-            echo "🏗️  Executando Terraform $ACTION..."
+            echo "🔑 [Auth] Iniciando nova sessão AWS na conta $role..."
             
-            (
-              cd "$PATH_DIR"
-              
-              # Init: Reconfigura o backend
-              terraform init -reconfigure -input=false
-              
-              if [ "$ACTION" == "plan" ]; then
-                terraform plan -input=false
-              elif [ "$ACTION" == "apply" ]; then
-                terraform apply -auto-approve -input=false
-              elif [ "$ACTION" == "destroy" ]; then
-                terraform destroy -auto-approve -input=false
-              fi
-            )
+            # Login AWS (Sem exportar para profile, usa env vars globais)
+            # Nota: Em ambiente real, use aws-actions/configure-aws-credentials se possível
+            # Aqui simulamos com comando AWS CLI direto
+            creds=$(aws sts assume-role --role-arn "$role" --role-session-name "EngineSession" --output json)
+            export AWS_ACCESS_KEY_ID=$(echo $creds | jq -r .Credentials.AccessKeyId)
+            export AWS_SECRET_ACCESS_KEY=$(echo $creds | jq -r .Credentials.SecretAccessKey)
+            export AWS_SESSION_TOKEN=$(echo $creds | jq -r .Credentials.SessionToken)
+            export AWS_REGION="$region"
+
+            # Atualiza Cache
+            CURRENT_TARGET_ID="$role"
+            CURRENT_TARGET_REGION="$region"
+        fi
+    fi
+}
+
+# ==============================================================================
+# FUNÇÃO: Executa Terraform (Isolado)
+# ==============================================================================
+run_terraform() {
+    local path=$1
+    local provider=$2
+    local auth=$3
+    local is_parallel=$4
+    
+    local log_file="logs/${path//\//_}.log" # Sanitiza nome do path
+    local exit_file="logs/${path//\//_}.exit"
+
+    (
+        # Se for paralelo, precisa autenticar aqui dentro (subshell)
+        if [ "$is_parallel" == "true" ]; then
+            authenticate_target "$provider" "$auth" "true"
+        fi
+
+        echo "🚀 Iniciando Terraform em $path..."
+        cd "$path"
+        terraform init -input=false > /dev/null
+        terraform apply -auto-approve -input=false
+    ) > "$log_file" 2>&1
+
+    echo $? > "$exit_file"
+}
+
+# ==============================================================================
+# LOOP PRINCIPAL
+# ==============================================================================
+
+# 1. Autenticação Global no Backend (Sempre necessária uma vez)
+BACKEND_ROLE=$(jq -r '.backend_global_config.role_arn' manifest.json)
+# ... Configura profile [backend] aqui ...
+
+TOTAL_STAGES=$(jq '.pipeline_stages | length' manifest.json)
+
+for (( i=0; i<$TOTAL_STAGES; i++ )); do
+    STAGE_NAME=$(jq -r ".pipeline_stages[$i].stage_name" manifest.json)
+    IS_PARALLEL=$(jq -r ".pipeline_stages[$i].parallel_execution" manifest.json)
+    STATES_JSON=$(jq -c ".pipeline_stages[$i].states[]" manifest.json)
+
+    echo "::group::📂 Estágio: $STAGE_NAME"
+
+    # Arrays de controle para o Dashboard
+    pids=""
+    active_paths=""
+
+    while read -r state; do
+        path=$(echo "$state" | jq -r '.path')
+        provider=$(echo "$state" | jq -r '.provider')
+        auth=$(echo "$state" | jq -r '.target_auth')
+
+        if [ "$IS_PARALLEL" == "true" ]; then
+            # Modo Paralelo: Joga para background (&)
+            # A auth acontece DENTRO da função run_terraform para não vazar
+            run_terraform "$path" "$provider" "$auth" "true" &
+            pids="$pids $!"
+            active_paths="$active_paths $path"
+        else
+            # Modo Sequencial: Usa Auth Inteligente no escopo principal
+            authenticate_target "$provider" "$auth" "false"
             
-            EXIT_CODE=$?
-            if [ $EXIT_CODE -ne 0 ]; then
-               echo "❌ Falha na execução do Terraform em $PATH_DIR"
-               exit $EXIT_CODE
-            fi
+            # Roda bloqueante (sem &)
+            # Pode redirecionar para arquivo e dar 'tail' para ver progresso
+            run_terraform "$path" "$provider" "$auth" "false"
+            
+            # Mostra o log imediatamente após acabar
+            cat "logs/${path//\//_}.log"
+        fi
+    done <<< "$STATES_JSON"
 
-            echo "::endgroup::"
-          done
+    # DASHBOARD PARA PARALELISMO
+    if [ "$IS_PARALLEL" == "true" ]; then
+        echo -e "${BOLD}Aguardando processos paralelos...${NC}"
+        wait $pids
+        
+        # Exibe logs finais organizados
+        for p in $active_paths; do
+            echo "📄 Log de: $p"
+            cat "logs/${p//\//_}.log"
+        done
+    fi
 
-          echo "✅ Pipeline finalizado com sucesso."
+    echo "::endgroup::"
+done
