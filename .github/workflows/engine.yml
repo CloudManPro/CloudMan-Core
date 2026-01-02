@@ -1,143 +1,229 @@
-#!/bin/bash
+name: Dynamic GitOps Engine (Full)
 
-# Configurações Visuais
-BOLD='\033[1m'
-BLUE='\033[0;34m'
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-NC='\033[0m'
-mkdir -p logs
+on:
+  workflow_call:
+    inputs:
+      default_region:
+        required: false
+        type: string
+        default: "us-east-1"
+  workflow_dispatch:
+  push:
+    paths:
+      - '**/manifest.json'
+      - '**/main.tf'
 
-# Variáveis Globais de Cache de Sessão (Para execução sequencial)
-CURRENT_TARGET_ID=""
-CURRENT_TARGET_REGION=""
+permissions:
+  id-token: write
+  contents: read
 
-# ==============================================================================
-# FUNÇÃO: Autenticação Inteligente (Com Cache)
-# ==============================================================================
-authenticate_target() {
-    local provider=$1
-    local auth_json=$2
-    local is_parallel=$3 # Se for paralelo, FORÇA re-autenticação isolada
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
-    # Se for paralelo, não podemos usar cache global (variáveis de ambiente conflitariam)
-    if [ "$is_parallel" == "true" ]; then
-        # Lógica de auth isolada (subshell) já é garantida pelo encapsulamento da função run_terraform
-        # Apenas executa o login normalmente
-        : 
-    else
-        # Se for sequencial, tenta usar o cache
-        if [ "$provider" == "aws" ]; then
-            local role=$(echo "$auth_json" | jq -r '.role_arn')
-            local region=$(echo "$auth_json" | jq -r '.region')
-            
-            # Check de Cache
-            if [ "$role" == "$CURRENT_TARGET_ID" ] && [ "$region" == "$CURRENT_TARGET_REGION" ]; then
-                echo "⚡ [Auth] Reutilizando sessão AWS existente ($role)..."
-                return
+      - name: 🛠️ Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: 🚀 Executar Pipeline Híbrido
+        shell: bash
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LOGIN_REGION: ${{ inputs.default_region || 'us-east-1' }}
+        run: |
+          # ==============================================================================
+          # CONFIGURAÇÕES E CORES
+          # ==============================================================================
+          set -o pipefail
+          BLUE='\033[0;34m'
+          CYAN='\033[0;36m'
+          GREEN='\033[0;32m'
+          RED='\033[0;31m'
+          NC='\033[0m'
+
+          # ==============================================================================
+          # FUNÇÃO 1: Obter Token OIDC (Herdado do seu código antigo)
+          # ==============================================================================
+          get_oidc_token() {
+            local aud="sts.amazonaws.com"
+            local token_url="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${aud}"
+            response=$(curl -s -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "$token_url")
+            echo $response | jq -r '.value'
+          }
+
+          # ==============================================================================
+          # FUNÇÃO 2: Autenticação Dinâmica (Backend Profile vs Target Env)
+          # ==============================================================================
+          authenticate() {
+            local role_arn=$1
+            local region=$2
+            local type=$3 # "backend" ou "target"
+            local session_name="CloudMan-${type}"
+
+            # 1. Pega Token GitHub
+            local jwt=$(get_oidc_token)
+            if [ "$jwt" == "null" ] || [ -z "$jwt" ]; then
+                echo "❌ Erro ao obter OIDC Token."
+                return 1
             fi
 
-            echo "🔑 [Auth] Iniciando nova sessão AWS na conta $role..."
-            
-            # Login AWS (Sem exportar para profile, usa env vars globais)
-            # Nota: Em ambiente real, use aws-actions/configure-aws-credentials se possível
-            # Aqui simulamos com comando AWS CLI direto
-            creds=$(aws sts assume-role --role-arn "$role" --role-session-name "EngineSession" --output json)
-            export AWS_ACCESS_KEY_ID=$(echo $creds | jq -r .Credentials.AccessKeyId)
-            export AWS_SECRET_ACCESS_KEY=$(echo $creds | jq -r .Credentials.SecretAccessKey)
-            export AWS_SESSION_TOKEN=$(echo $creds | jq -r .Credentials.SessionToken)
-            export AWS_REGION="$region"
+            # 2. Assume Role na AWS
+            local creds=$(aws sts assume-role-with-web-identity \
+              --role-arn "$role_arn" \
+              --role-session-name "$session_name" \
+              --web-identity-token "$jwt" \
+              --duration-seconds 900 \
+              --region "$region" \
+              --output json)
 
-            # Atualiza Cache
-            CURRENT_TARGET_ID="$role"
-            CURRENT_TARGET_REGION="$region"
-        fi
-    fi
-}
+            if [ $? -ne 0 ]; then
+               echo "❌ Erro ao assumir role $role_arn"
+               return 1
+            fi
 
-# ==============================================================================
-# FUNÇÃO: Executa Terraform (Isolado)
-# ==============================================================================
-run_terraform() {
-    local path=$1
-    local provider=$2
-    local auth=$3
-    local is_parallel=$4
-    
-    local log_file="logs/${path//\//_}.log" # Sanitiza nome do path
-    local exit_file="logs/${path//\//_}.exit"
+            local key_id=$(echo $creds | jq -r '.Credentials.AccessKeyId')
+            local secret=$(echo $creds | jq -r '.Credentials.SecretAccessKey')
+            local token=$(echo $creds | jq -r '.Credentials.SessionToken')
 
-    (
-        # Se for paralelo, precisa autenticar aqui dentro (subshell)
-        if [ "$is_parallel" == "true" ]; then
-            authenticate_target "$provider" "$auth" "true"
-        fi
+            if [ "$type" == "backend" ]; then
+                # Salva no profile para o Terraform Backend S3 usar
+                aws configure set aws_access_key_id "$key_id" --profile backend
+                aws configure set aws_secret_access_key "$secret" --profile backend
+                aws configure set aws_session_token "$token" --profile backend
+                aws configure set region "$region" --profile backend
+            else
+                # Exporta como Env Var para o Provider AWS usar
+                export AWS_ACCESS_KEY_ID="$key_id"
+                export AWS_SECRET_ACCESS_KEY="$secret"
+                export AWS_SESSION_TOKEN="$token"
+                export AWS_REGION="$region"
+            fi
+          }
 
-        echo "🚀 Iniciando Terraform em $path..."
-        cd "$path"
-        terraform init -input=false > /dev/null
-        terraform apply -auto-approve -input=false
-    ) > "$log_file" 2>&1
+          # ==============================================================================
+          # FUNÇÃO 3: Execução do Terraform (Suporta Logs com Tag)
+          # ==============================================================================
+          run_terraform_process() {
+              local path=$1
+              local action=$2
+              local auth_json=$3
+              local provider=$4
+              local label="[$path]"
+              
+              # Cor diferente para Azure (visual)
+              local color=$BLUE
+              if [ "$provider" == "azure" ]; then color=$CYAN; fi
 
-    echo $? > "$exit_file"
-}
+              # Cria subshell para isolar variáveis de ambiente do Target
+              (
+                  # 1. Autentica no Target (dentro do subshell)
+                  if [ "$provider" == "aws" ]; then
+                      local t_role=$(echo "$auth_json" | jq -r '.role_arn')
+                      local t_region=$(echo "$auth_json" | jq -r '.region')
+                      authenticate "$t_role" "$t_region" "target"
+                  elif [ "$provider" == "azure" ]; then
+                      # Lógica Azure aqui (export ARM_...)
+                      :
+                  fi
 
-# ==============================================================================
-# LOOP PRINCIPAL
-# ==============================================================================
+                  echo -e "${color}▶️ ${label} Iniciando Terraform $action...${NC}"
 
-# 1. Autenticação Global no Backend (Sempre necessária uma vez)
-BACKEND_ROLE=$(jq -r '.backend_global_config.role_arn' manifest.json)
-# ... Configura profile [backend] aqui ...
+                  cd "$path"
+                  
+                  # 2. Executa Terraform
+                  # O profile 'backend' já foi configurado globalmente antes
+                  terraform init -reconfigure -input=false > /dev/null 2>&1
 
-TOTAL_STAGES=$(jq '.pipeline_stages | length' manifest.json)
+                  if [ "$action" == "plan" ]; then
+                    terraform plan -input=false
+                  elif [ "$action" == "apply" ]; then
+                    terraform apply -auto-approve -input=false
+                  elif [ "$action" == "destroy" ]; then
+                    terraform destroy -auto-approve -input=false
+                  fi
+              ) 2>&1 | stdbuf -oL sed "s/^/${color}${label} ${NC}/" # Adiciona Tag Visual
 
-for (( i=0; i<$TOTAL_STAGES; i++ )); do
-    STAGE_NAME=$(jq -r ".pipeline_stages[$i].stage_name" manifest.json)
-    IS_PARALLEL=$(jq -r ".pipeline_stages[$i].parallel_execution" manifest.json)
-    STATES_JSON=$(jq -c ".pipeline_stages[$i].states[]" manifest.json)
+              # Retorna o exit code do pipeline (graças ao set -o pipefail)
+              return $?
+          }
 
-    echo "::group::📂 Estágio: $STAGE_NAME"
+          # ==============================================================================
+          # MAIN: LÓGICA PRINCIPAL
+          # ==============================================================================
+          
+          # 1. Detecção do Manifesto (Do seu código antigo)
+          echo "🔍 Buscando manifest.json..."
+          MANIFEST_PATH=$(git diff --name-only HEAD^ HEAD | grep "manifest.json" | head -n 1)
+          if [ -z "$MANIFEST_PATH" ]; then
+            MANIFEST_PATH=$(find . -name "manifest.json" -not -path "*/.*" | head -n 1)
+          fi
+          if [ -z "$MANIFEST_PATH" ]; then
+            echo "❌ Erro: Nenhum manifest.json encontrado."
+            exit 1
+          fi
+          echo "✅ Manifesto carregado: $MANIFEST_PATH"
 
-    # Arrays de controle para o Dashboard
-    pids=""
-    active_paths=""
+          # 2. Configurações Globais
+          ACTION=$(jq -r '.action // "apply"' "$MANIFEST_PATH") # Default apply se vazio
+          BACKEND_ROLE=$(jq -r '.backend_global_config.role_arn' "$MANIFEST_PATH")
+          BACKEND_REGION=$(jq -r '.backend_global_config.region' "$MANIFEST_PATH")
 
-    while read -r state; do
-        path=$(echo "$state" | jq -r '.path')
-        provider=$(echo "$state" | jq -r '.provider')
-        auth=$(echo "$state" | jq -r '.target_auth')
+          echo "⚡ Ação Global: $ACTION"
+          echo "🔑 Configurando Backend Profile ($BACKEND_ROLE)..."
+          authenticate "$BACKEND_ROLE" "$BACKEND_REGION" "backend"
 
-        if [ "$IS_PARALLEL" == "true" ]; then
-            # Modo Paralelo: Joga para background (&)
-            # A auth acontece DENTRO da função run_terraform para não vazar
-            run_terraform "$path" "$provider" "$auth" "true" &
-            pids="$pids $!"
-            active_paths="$active_paths $path"
-        else
-            # Modo Sequencial: Usa Auth Inteligente no escopo principal
-            authenticate_target "$provider" "$auth" "false"
-            
-            # Roda bloqueante (sem &)
-            # Pode redirecionar para arquivo e dar 'tail' para ver progresso
-            run_terraform "$path" "$provider" "$auth" "false"
-            
-            # Mostra o log imediatamente após acabar
-            cat "logs/${path//\//_}.log"
-        fi
-    done <<< "$STATES_JSON"
+          # 3. Loop pelos Estágios
+          TOTAL_STAGES=$(jq '.pipeline_stages | length' "$MANIFEST_PATH")
 
-    # DASHBOARD PARA PARALELISMO
-    if [ "$IS_PARALLEL" == "true" ]; then
-        echo -e "${BOLD}Aguardando processos paralelos...${NC}"
-        wait $pids
-        
-        # Exibe logs finais organizados
-        for p in $active_paths; do
-            echo "📄 Log de: $p"
-            cat "logs/${p//\//_}.log"
-        done
-    fi
+          for (( i=0; i<$TOTAL_STAGES; i++ )); do
+              STAGE_NAME=$(jq -r ".pipeline_stages[$i].stage_name" "$MANIFEST_PATH")
+              IS_PARALLEL=$(jq -r ".pipeline_stages[$i].parallel_execution" "$MANIFEST_PATH")
+              STATES_JSON=$(jq -c ".pipeline_stages[$i].states[]" "$MANIFEST_PATH")
 
-    echo "::endgroup::"
-done
+              echo "::group::🚀 Estágio: $STAGE_NAME (Paralelo: $IS_PARALLEL)"
+
+              pids=""
+              failed=0
+
+              while read -r state; do
+                  path=$(echo "$state" | jq -r '.path')
+                  provider=$(echo "$state" | jq -r '.provider')
+                  target_auth=$(echo "$state" | jq -r '.target_auth')
+                  
+                  if [ ! -d "$path" ]; then
+                       echo "⚠️  Diretório $path não existe. Pulando."
+                       continue
+                  fi
+
+                  if [ "$IS_PARALLEL" == "true" ]; then
+                      # Roda em background
+                      run_terraform_process "$path" "$ACTION" "$target_auth" "$provider" &
+                      pids="$pids $!"
+                  else
+                      # Roda sequencial
+                      run_terraform_process "$path" "$ACTION" "$target_auth" "$provider"
+                      if [ $? -ne 0 ]; then failed=1; break; fi
+                  fi
+              done <<< "$STATES_JSON"
+
+              # Se paralelo, aguarda todos
+              if [ "$IS_PARALLEL" == "true" ]; then
+                  for pid in $pids; do
+                      wait $pid
+                      if [ $? -ne 0 ]; then failed=1; fi
+                  done
+              fi
+
+              if [ $failed -ne 0 ]; then
+                  echo "::error::Falha na execução do estágio $STAGE_NAME"
+                  exit 1
+              fi
+
+              echo "::endgroup::"
+          done
+
+          echo "✅ Pipeline finalizado com sucesso."
