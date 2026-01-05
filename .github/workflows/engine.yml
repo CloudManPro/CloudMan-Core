@@ -145,7 +145,7 @@ jobs:
                   elif [ "$action" == "destroy" ]; then
                     terraform destroy -auto-approve -input=false
                   fi
-              ) 2>&1 | stdbuf -oL sed "s/^/${color}${label} ${NC}/" # Adiciona Tag Visual
+              ) 2>&1 | stdbuf -oL sed "s|^|${color}${label} ${NC}|" # Adiciona Tag Visual
 
               # Retorna o exit code do pipeline (graças ao set -o pipefail)
               return $?
