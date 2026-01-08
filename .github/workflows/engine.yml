@@ -176,8 +176,52 @@ jobs:
           echo "🔑 Configurando Backend Profile ($BACKEND_ROLE)..."
           authenticate "$BACKEND_ROLE" "$BACKEND_REGION" "backend"
 
+          # ==============================================================================
+          # NOVO: CLONE DE DEPENDÊNCIAS EXTERNAS (Repo Source-First)
+          # ==============================================================================
+          EXTERNAL_REPOS=$(jq -c '.external_repositories // []' "$MANIFEST_PATH")
+          
+          if [ "$EXTERNAL_REPOS" != "[]" ] && [ "$EXTERNAL_REPOS" != "null" ]; then
+              echo "📦 Clonando repositórios externos definidos no manifesto..."
+              
+              # Itera sobre cada objeto do array
+              echo "$EXTERNAL_REPOS" | jq -c '.[]' | while read -r repo; do
+                  REPO_NAME=$(echo "$repo" | jq -r '.repo_name')
+                  ORG=$(echo "$repo" | jq -r '.org')
+                  BRANCH=$(echo "$repo" | jq -r '.branch')
+                  TARGET_DIR=$(echo "$repo" | jq -r '.target_dir')
+                  
+                  # Monta o caminho absoluto onde o Terraform vai procurar (.external_modules fica na raiz do estado?)
+                  # Nota: O Terraform (archive_file) espera achar em .external_modules relativo ao main.tf.
+                  # Como o script roda na raiz do checkout, vamos clonar na raiz do checkout para simplificar,
+                  # ou dentro da pasta do estado. 
+                  
+                  # A abordagem mais segura para o archive_file `${path.module}/.external_modules` funcionar
+                  # é clonar DENTRO da pasta onde o Terraform vai rodar.
+                  # Mas o manifesto pode ter vários estados. Vamos clonar na RAIZ do Runner em .external_modules
+                  # e garantir que o Terraform procure lá, OU (melhor para sua arquitetura atual):
+                  
+                  # Vamos clonar para cada pasta de estado? Não, ineficiente.
+                  # Vamos clonar para a raiz do workspace atual: ./.external_modules/Repo
+                  
+                  FULL_TARGET_DIR="./$TARGET_DIR" # ex: ./.external_modules/CloudMan
+                  
+                  # Monta URL com Token do GitHub (o token do Actions serve para a própria Org)
+                  REPO_URL="https://oauth2:${ACTIONS_ID_TOKEN_REQUEST_TOKEN}@github.com/${ORG}/${REPO_NAME}.git"
+                  
+                  if [ ! -d "$FULL_TARGET_DIR" ]; then
+                      echo "⬇️ Clonando $ORG/$REPO_NAME ($BRANCH) em $FULL_TARGET_DIR..."
+                      git clone --depth 1 -b "$BRANCH" "$REPO_URL" "$FULL_TARGET_DIR"
+                  else
+                      echo "🔄 Atualizando $REPO_NAME..."
+                      (cd "$FULL_TARGET_DIR" && git fetch origin "$BRANCH" && git reset --hard "origin/$BRANCH")
+                  fi
+              done
+          fi
+
           # 3. Loop pelos Estágios
           TOTAL_STAGES=$(jq '.pipeline_stages | length' "$MANIFEST_PATH")
+
 
           for (( i=0; i<$TOTAL_STAGES; i++ )); do
               STAGE_NAME=$(jq -r ".pipeline_stages[$i].stage_name" "$MANIFEST_PATH")
