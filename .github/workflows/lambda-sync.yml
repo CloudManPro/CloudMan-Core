@@ -1,6 +1,27 @@
-name: "CloudMan: Lambda Sync"
+name: "CloudMan Engine: Lambda Sync"
 
 on:
+  # Permitir ser chamado por workflows de outros repositórios (Clientes)
+  workflow_call:
+    inputs:
+      direction:
+        type: string
+        description: "push (AWS->Git) or pull (Git->AWS)"
+        required: true
+      region:
+        type: string
+        description: "Default AWS Region"
+        default: "us-east-1"
+      role_arn:
+        type: string
+        description: "IAM Role to Assume via OIDC"
+        required: true
+      resources_json:
+        type: string
+        description: "JSON Array of resources to sync"
+        required: true
+
+  # Permitir disparo manual direto (para testes internos)
   workflow_dispatch:
     inputs:
       direction:
@@ -17,15 +38,19 @@ on:
         required: true
 
 permissions:
-  id-token: write   # Obrigatório para OIDC AWS
-  contents: write   # Obrigatório para Push no Git
+  id-token: write   # Obrigatório para autenticação OIDC AWS
+  contents: write   # Obrigatório para Push no Git (quando direction=push)
 
 jobs:
-  sync:
+  sync-engine:
     runs-on: ubuntu-latest
     steps:
-      - name: 📥 Checkout Repo
+      - name: 📥 Checkout Repository
         uses: actions/checkout@v4
+        with:
+          # Garante que baixamos o código do repositório onde o workflow está rodando (Cliente),
+          # e não o código do repositório do Engine.
+          repository: ${{ github.repository }}
 
       - name: 🔑 Configure AWS Credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -34,7 +59,7 @@ jobs:
           aws-region: ${{ inputs.region }}
           role-session-name: CloudManSyncSession
 
-      - name: ⚡ Process Resources (Node.js Script)
+      - name: ⚡ Process Resources (CloudMan Engine)
         id: processor
         uses: actions/github-script@v7
         env:
@@ -48,101 +73,121 @@ jobs:
 
             // 1. Parse Inputs
             const direction = process.env.INPUT_DIRECTION;
-            const resources = JSON.parse(process.env.INPUT_RESOURCES);
+            let resources = [];
+            
+            try {
+                resources = JSON.parse(process.env.INPUT_RESOURCES);
+            } catch (e) {
+                console.error("❌ Failed to parse resources_json. Ensure it's a valid JSON string.");
+                throw e;
+            }
 
             console.log(`🚀 Starting ${direction.toUpperCase()} for ${resources.length} resources...`);
 
-            // Helper para rodar comandos shell
+            // Helper: Run Shell Command
             function run(cmd) {
               try {
-                // stdio: 'inherit' imprime logs em tempo real no console do Action
-                execSync(cmd, { stdio: 'inherit' });
+                execSync(cmd, { stdio: 'inherit' }); // stdio: inherit mostra logs em tempo real
               } catch (e) {
                 console.error(`❌ Command failed: ${cmd}`);
-                throw e; // Aborta o job em caso de erro
+                throw e;
               }
             }
 
-            // 2. Loop Principal
+            // 2. Main Processing Loop
             for (const res of resources) {
-                const funcArn = res.function_arn;
-                // Para simplificar, assumimos que o ARN tem o nome da função no final
-                // mas para get-function o ARN completo funciona perfeitamente.
-                
-                const folder = res.folder_path;
-                
-                // Extrai região do ARN se necessário, ou usa a do recurso
-                const region = res.region || 'us-east-1';
+                // Support generic 'id' or specific 'function_arn'
+                const funcId = res.function_arn || res.id; 
+                const folder = res.folder_path || res.git_path;
+                const provider = res.provider || 'aws'; // Default AWS
+                const region = res.region || '${{ inputs.region }}';
+
+                if (provider !== 'aws') {
+                    console.warn(`⚠️ Provider '${provider}' not fully supported yet. Skipping ${funcId}.`);
+                    continue;
+                }
 
                 console.log(`\n---------------------------------------------------`);
-                console.log(`📦 Processing: ${funcArn}`);
+                console.log(`📦 Resource: ${funcId}`);
                 console.log(`📂 Folder: ${folder}`);
                 console.log(`🌍 Region: ${region}`);
 
                 if (direction === 'push') {
-                    // --- PUSH (AWS -> GIT) ---
+                    // --- PUSH (CLOUD -> GIT) ---
                     console.log('🔽 Downloading code from AWS...');
                     
-                    // a) Get Function URL
-                    // Usamos query especifico para pegar so a URL
-                    // Nota: child_process execSync retorna Buffer, precisamos converter string
-                    const getUrlCmd = `aws lambda get-function --function-name "${funcArn}" --query 'Code.Location' --output text --region ${region}`;
+                    // a) Get Code URL (AWS CLI)
+                    const getUrlCmd = `aws lambda get-function --function-name "${funcId}" --query 'Code.Location' --output text --region ${region}`;
                     const url = execSync(getUrlCmd).toString().trim();
 
                     if (!url || url === 'None') {
-                        throw new Error(`Could not get code URL for ${funcArn}`);
+                        throw new Error(`Could not get code URL for ${funcId}. Check if function exists.`);
                     }
 
-                    // b) Download & Unzip
-                    run(`mkdir -p temp_lambda`);
-                    run(`curl -L "${url}" -o lambda.zip`);
-                    run(`unzip -o lambda.zip -d temp_lambda`);
+                    // b) Download & Unzip safely
+                    run(`mkdir -p temp_lambda_dl`);
+                    run(`curl -sL "${url}" -o lambda_dl.zip`);
+                    run(`unzip -o -q lambda_dl.zip -d temp_lambda_dl`);
                     
-                    // c) Sync to Git Folder (Rsync para limpar deletados)
+                    // c) Sync to Git Folder
                     run(`mkdir -p "${folder}"`);
-                    // -a: archive mode, -v: verbose, --delete: remove arquivos locais que não existem na AWS
-                    // Exclui .git para não corromper repo
-                    run(`rsync -av --delete --exclude '.git' temp_lambda/ "${folder}/"`);
+                    // Rsync: archive mode, verbose, delete extra files locally, exclude .git
+                    run(`rsync -av --delete --exclude '.git' temp_lambda_dl/ "${folder}/"`);
                     
                     // d) Cleanup
-                    run(`rm -rf temp_lambda lambda.zip`);
+                    run(`rm -rf temp_lambda_dl lambda_dl.zip`);
 
                 } else if (direction === 'pull') {
-                    // --- PULL (GIT -> AWS) ---
+                    // --- PULL (GIT -> CLOUD) ---
                     console.log('🔼 Uploading code to AWS...');
                     
                     if (!fs.existsSync(folder)) {
-                         console.warn(`⚠️ Folder ${folder} does not exist. Skipping.`);
+                         console.warn(`⚠️ Folder '${folder}' does not exist in repo. Skipping.`);
                          continue;
                     }
 
-                    // a) Zip Folder
-                    // zip -r -j (junk paths) não queremos pastas, mas lambda geralmente precisa de estrutura
-                    // cd folder && zip -r ../deploy.zip .
-                    const zipPath = 'deploy_package.zip';
-                    run(`cd "${folder}" && zip -r -X "../../${zipPath}" .`);
+                    // a) Zip Folder Content
+                    // -X: Keeps file attributes, -r: recursive
+                    // Zipa o conteúdo da pasta, não a pasta em si.
+                    const zipName = `deploy_${Date.now()}.zip`;
+                    run(`cd "${folder}" && zip -r -X -q "../../${zipName}" .`);
 
                     // b) Update Function Code
-                    run(`aws lambda update-function-code --function-name "${funcArn}" --zip-file fileb://${zipPath} --region ${region}`);
+                    run(`aws lambda update-function-code --function-name "${funcId}" --zip-file fileb://${zipName} --region ${region} --publish`);
 
                     // c) Cleanup
-                    run(`rm ${zipPath}`);
+                    run(`rm ${zipName}`);
+
+                } else if (direction === 'create') {
+                    // --- CREATE (BOILERPLATE) ---
+                    console.log('✨ Initializing boilerplate...');
+                    
+                    if (fs.existsSync(folder)) {
+                        console.log(`Folder '${folder}' already exists. Skipping init.`);
+                        continue;
+                    }
+                    
+                    run(`mkdir -p "${folder}"`);
+                    // Cria um index.js básico (Node.js) como exemplo
+                    const boilerplate = `exports.handler = async (event) => {\n  return { statusCode: 200, body: 'Hello from CloudMan!' };\n};`;
+                    fs.writeFileSync(path.join(folder, 'index.js'), boilerplate);
+                    console.log(`Created index.js in ${folder}`);
                 }
             }
 
-      - name: 📝 Commit Changes (Push Only)
-        if: inputs.direction == 'push'
+      - name: 📝 Commit Changes (Push/Create Only)
+        if: inputs.direction == 'push' || inputs.direction == 'create'
         run: |
           git config user.name "CloudMan Bot"
           git config user.email "bot@cloudman.pro"
           
-          # Adiciona tudo
           git add .
           
-          # Verifica se tem mudanças
+          # Commit only if changes exist
           if git diff --staged --quiet; then
-            echo "No changes to commit."
+            echo "✅ No changes to commit."
           else
-            git commit -m "cloudman(sync): Sync code from AWS [skip ci]"
+            git commit -m "cloudman(sync): Sync code from Cloud [skip ci]"
             git push
+            echo "✅ Changes pushed successfully."
           fi
