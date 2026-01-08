@@ -1,0 +1,148 @@
+name: "CloudMan: Lambda Sync"
+
+on:
+  workflow_dispatch:
+    inputs:
+      direction:
+        description: "push (AWS->Git) or pull (Git->AWS)"
+        required: true
+      region:
+        description: "Default AWS Region"
+        default: "us-east-1"
+      role_arn:
+        description: "IAM Role to Assume via OIDC"
+        required: true
+      resources_json:
+        description: "JSON Array of resources to sync"
+        required: true
+
+permissions:
+  id-token: write   # Obrigatório para OIDC AWS
+  contents: write   # Obrigatório para Push no Git
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: 🔑 Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.role_arn }}
+          aws-region: ${{ inputs.region }}
+          role-session-name: CloudManSyncSession
+
+      - name: ⚡ Process Resources (Node.js Script)
+        id: processor
+        uses: actions/github-script@v7
+        env:
+          INPUT_DIRECTION: ${{ inputs.direction }}
+          INPUT_RESOURCES: ${{ inputs.resources_json }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const { execSync } = require('child_process');
+
+            // 1. Parse Inputs
+            const direction = process.env.INPUT_DIRECTION;
+            const resources = JSON.parse(process.env.INPUT_RESOURCES);
+
+            console.log(`🚀 Starting ${direction.toUpperCase()} for ${resources.length} resources...`);
+
+            // Helper para rodar comandos shell
+            function run(cmd) {
+              try {
+                // stdio: 'inherit' imprime logs em tempo real no console do Action
+                execSync(cmd, { stdio: 'inherit' });
+              } catch (e) {
+                console.error(`❌ Command failed: ${cmd}`);
+                throw e; // Aborta o job em caso de erro
+              }
+            }
+
+            // 2. Loop Principal
+            for (const res of resources) {
+                const funcArn = res.function_arn;
+                // Para simplificar, assumimos que o ARN tem o nome da função no final
+                // mas para get-function o ARN completo funciona perfeitamente.
+                
+                const folder = res.folder_path;
+                
+                // Extrai região do ARN se necessário, ou usa a do recurso
+                const region = res.region || 'us-east-1';
+
+                console.log(`\n---------------------------------------------------`);
+                console.log(`📦 Processing: ${funcArn}`);
+                console.log(`📂 Folder: ${folder}`);
+                console.log(`🌍 Region: ${region}`);
+
+                if (direction === 'push') {
+                    // --- PUSH (AWS -> GIT) ---
+                    console.log('🔽 Downloading code from AWS...');
+                    
+                    // a) Get Function URL
+                    // Usamos query especifico para pegar so a URL
+                    // Nota: child_process execSync retorna Buffer, precisamos converter string
+                    const getUrlCmd = `aws lambda get-function --function-name "${funcArn}" --query 'Code.Location' --output text --region ${region}`;
+                    const url = execSync(getUrlCmd).toString().trim();
+
+                    if (!url || url === 'None') {
+                        throw new Error(`Could not get code URL for ${funcArn}`);
+                    }
+
+                    // b) Download & Unzip
+                    run(`mkdir -p temp_lambda`);
+                    run(`curl -L "${url}" -o lambda.zip`);
+                    run(`unzip -o lambda.zip -d temp_lambda`);
+                    
+                    // c) Sync to Git Folder (Rsync para limpar deletados)
+                    run(`mkdir -p "${folder}"`);
+                    // -a: archive mode, -v: verbose, --delete: remove arquivos locais que não existem na AWS
+                    // Exclui .git para não corromper repo
+                    run(`rsync -av --delete --exclude '.git' temp_lambda/ "${folder}/"`);
+                    
+                    // d) Cleanup
+                    run(`rm -rf temp_lambda lambda.zip`);
+
+                } else if (direction === 'pull') {
+                    // --- PULL (GIT -> AWS) ---
+                    console.log('🔼 Uploading code to AWS...');
+                    
+                    if (!fs.existsSync(folder)) {
+                         console.warn(`⚠️ Folder ${folder} does not exist. Skipping.`);
+                         continue;
+                    }
+
+                    // a) Zip Folder
+                    // zip -r -j (junk paths) não queremos pastas, mas lambda geralmente precisa de estrutura
+                    // cd folder && zip -r ../deploy.zip .
+                    const zipPath = 'deploy_package.zip';
+                    run(`cd "${folder}" && zip -r -X "../../${zipPath}" .`);
+
+                    // b) Update Function Code
+                    run(`aws lambda update-function-code --function-name "${funcArn}" --zip-file fileb://${zipPath} --region ${region}`);
+
+                    // c) Cleanup
+                    run(`rm ${zipPath}`);
+                }
+            }
+
+      - name: 📝 Commit Changes (Push Only)
+        if: inputs.direction == 'push'
+        run: |
+          git config user.name "CloudMan Bot"
+          git config user.email "bot@cloudman.pro"
+          
+          # Adiciona tudo
+          git add .
+          
+          # Verifica se tem mudanças
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "cloudman(sync): Sync code from AWS [skip ci]"
+            git push
+          fi
