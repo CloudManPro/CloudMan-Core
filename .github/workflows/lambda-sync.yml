@@ -46,12 +46,11 @@ jobs:
   sync-engine:
     runs-on: ubuntu-latest
     steps:
-      - name: 📥 Checkout Repository
+      - name: 📥 Checkout Target Repository
         uses: actions/checkout@v4
         with:
-          # Garante que baixamos o código do repositório onde o workflow está rodando (Cliente),
-          # e não o código do repositório do Engine.
-          repository: ${{ github.repository }}
+          repository: ${{ inputs.target_repo }}
+          ref: ${{ inputs.target_branch }}
 
       - name: 🔑 Configure AWS Credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
