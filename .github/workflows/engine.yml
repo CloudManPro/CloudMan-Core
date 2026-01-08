@@ -136,7 +136,7 @@ jobs:
                   
                   # 2. Executa Terraform
                   # O profile 'backend' já foi configurado globalmente antes
-                  terraform init -reconfigure -input=false > /dev/null 2>&1
+                  terraform init -reconfigure -input=false
 
                   if [ "$action" == "plan" ]; then
                     terraform plan -input=false
