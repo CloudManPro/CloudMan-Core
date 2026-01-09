@@ -2,7 +2,7 @@
 name: "CloudMan Engine: Lambda Sync"
 
 on:
-  # Permitir ser chamado por workflows de outros repositórios (Clientes)
+  # Permite ser chamado por workflows de outros repositórios (Clientes)
   workflow_call:
     inputs:
       # 1. Parâmetros de Operação
@@ -33,13 +33,13 @@ on:
         description: "Target Branch"
         default: "main"
 
-      # 3. Autenticação Automatizada (GitHub App)
+      # 3. Autenticação Automatizada (GitHub App Token)
       git_token:
         type: string
         description: "App Token passed from backend/listener"
         required: true
 
-  # Permitir disparo manual direto (para testes internos)
+  # Permite disparo manual (para testes)
   workflow_dispatch:
     inputs:
       direction:
@@ -59,24 +59,24 @@ on:
         required: true
 
 permissions:
-  id-token: write   # Obrigatório para autenticação OIDC AWS
-  contents: write   # Obrigatório para operações Git
+  id-token: write   # Autenticação AWS
+  contents: write   # Git Push
 
 jobs:
   sync-engine:
     runs-on: ubuntu-latest
     steps:
       - name: 🛡️ Mask Token
-        # Segurança: Garante que o token não apareça nos logs
+        # Segurança: Oculta o token caso seja impresso nos logs
         run: echo "::add-mask::${{ inputs.git_token }}"
 
       - name: 📥 Checkout Target Repository
         uses: actions/checkout@v4
         with:
-          # Baixa o repositório definido no input (o do cliente)
+          # Baixa o repositório do cliente
           repository: ${{ inputs.target_repo }}
           ref: ${{ inputs.target_branch }}
-          # Usa o token da App para ter permissão de escrita
+          # Usa o token da App para permitir o push
           token: ${{ inputs.git_token }}
 
       - name: 🔑 Configure AWS Credentials (OIDC)
@@ -98,47 +98,47 @@ jobs:
             const path = require('path');
             const { execSync } = require('child_process');
 
-            // --- HELPER: DETECÇÃO DE RUNTIME ---
+            // --- HELPER: DETECT RUNTIME & BOILERPLATE ---
             function getBoilerplate(runtime) {
                 const r = (runtime || '').toLowerCase();
 
-                // 1. Python
+                // 1. Python (python3.9, python3.11, etc.)
                 if (r.includes('python')) {
-                    return {
+                    return [{
                         filename: 'lambda_function.py',
                         content: `import json\n\ndef lambda_handler(event, context):\n    # TODO: Implement your logic here\n    return {\n        'statusCode': 200,\n        'body': json.dumps('Hello from CloudMan (Python)!')\n    }`
-                    };
+                    }];
                 }
-                // 2. Node.js
+
+                // 2. Node.js (nodejs18.x, nodejs20.x, etc.)
+                // Verifica 'node' ou 'js' para ser flexível
                 if (r.includes('node') || r.includes('js')) {
-                    return {
+                    return [{
                         filename: 'index.js',
                         content: `exports.handler = async (event) => {\n    // TODO: Implement your logic here\n    const response = {\n        statusCode: 200,\n        body: JSON.stringify('Hello from CloudMan (Node.js)!'),\n    };\n    return response;\n};`
-                    };
+                    }];
                 }
-                // 3. Java
-                if (r.includes('java')) {
-                    return {
-                        filename: 'Handler.java',
-                        content: `package example;\nimport com.amazonaws.services.lambda.runtime.Context;\nimport com.amazonaws.services.lambda.runtime.RequestHandler;\n\npublic class Handler implements RequestHandler<Object, String>{\n  @Override\n  public String handleRequest(Object input, Context context) {\n    return "Hello from CloudMan (Java)!";\n  }\n}`
-                    };
+
+                // 3. Ruby (ruby3.2, ruby3.3, etc.)
+                if (r.includes('ruby')) {
+                    return [
+                        {
+                            filename: 'lambda_function.rb',
+                            content: `require 'json'\n\ndef lambda_handler(event:, context:)\n    { statusCode: 200, body: JSON.generate('Hello from CloudMan (Ruby)!') }\nend`
+                        },
+                        {
+                            // Ruby geralmente precisa de Gemfile se usar libs externas
+                            filename: 'Gemfile',
+                            content: `source 'https://rubygems.org'\n\n# gem 'aws-sdk-s3'`
+                        }
+                    ];
                 }
-                // 4. Go
-                if (r.includes('go')) {
-                    return {
-                        filename: 'main.go',
-                        content: `package main\nimport (\n\t"github.com/aws/aws-lambda-go/lambda"\n)\nfunc HandleRequest() (string, error) {\n\treturn "Hello from CloudMan (Go)!", nil\n}\nfunc main() {\n\tlambda.Start(HandleRequest)\n}`
-                    };
-                }
-                
-                // Fallback (Node)
-                return {
-                    filename: 'index.js',
-                    content: `exports.handler = async (event) => {\n  return { statusCode: 200, body: 'Hello from CloudMan (Default)!' };\n};`
-                };
+
+                // Caso não seja um desses 3, retorna NULL para ser ignorado
+                return null;
             }
 
-            // --- HELPER: SHELL EXEC ---
+            // --- HELPER: SHELL EXECUTION ---
             function run(cmd) {
               try {
                 execSync(cmd, { stdio: 'inherit' }); 
@@ -165,34 +165,42 @@ jobs:
                 const funcId = res.function_arn || res.id; 
                 const folder = res.folder_path || res.git_path;
                 const region = res.region || '${{ inputs.region }}';
-                // Captura o runtime enviado pelo Front (ou vazio se não tiver)
-                const runtime = res.runtime || ''; 
+                // Captura o runtime, garante string vazia se null
+                const runtime = (res.runtime || '').trim();
 
                 console.log(`\n---------------------------------------------------`);
                 console.log(`📦 Resource: ${funcId}`);
                 console.log(`📂 Folder: ${folder}`);
-                console.log(`⚙️ Runtime: ${runtime || 'Unknown (Using Default)'}`);
+                console.log(`⚙️ Runtime: ${runtime || 'Unknown'}`);
 
-                // --- CREATE (INIT) ---
+                // --- CREATE (BOILERPLATE) ---
                 if (direction === 'create') {
-                    console.log('✨ Initializing boilerplate...');
-                    
+                    console.log('✨ Checking boilerplate support...');
+
                     if (fs.existsSync(folder)) {
                         console.log(`Folder '${folder}' already exists. Skipping.`);
                         continue;
                     }
                     
+                    // Verifica se o runtime é suportado (Node, Python, Ruby)
+                    const templates = getBoilerplate(runtime);
+
+                    if (!templates) {
+                        console.warn(`⚠️ Skipped: Runtime '${runtime}' is not supported for editable boilerplate (compiled language or unknown).`);
+                        continue;
+                    }
+                    
                     run(`mkdir -p "${folder}"`);
 
-                    // Gera o arquivo correto baseado no runtime
-                    const template = getBoilerplate(runtime);
-                    const filePath = path.join(folder, template.filename);
+                    // Cria os arquivos definidos no template
+                    for (const tmpl of templates) {
+                        const filePath = path.join(folder, tmpl.filename);
+                        fs.writeFileSync(filePath, tmpl.content);
+                        console.log(`✅ Created ${tmpl.filename}`);
+                    }
                     
-                    fs.writeFileSync(filePath, template.content);
-                    console.log(`✅ Created ${template.filename}`);
-                    
-                    // Cria um README de metadados
-                    fs.writeFileSync(path.join(folder, 'README.md'), `# ${funcId}\n\nRuntime: ${runtime}\nGenerated automatically by CloudMan.`);
+                    // Metadata file
+                    fs.writeFileSync(path.join(folder, 'README.md'), `# ${funcId}\n\nRuntime: ${runtime}\nGenerated by CloudMan.`);
 
                 // --- PUSH (CLOUD -> GIT) ---
                 } else if (direction === 'push') {
@@ -236,11 +244,13 @@ jobs:
           
           git add .
           
-          # Verifica se há mudanças no stage (Exit code 1 significa que há diferenças)
+          # Verifica se há algo para comitar (Exit code 1 significa mudanças)
           if ! git diff --staged --quiet; then
             git commit -m "cloudman(sync): Sync code from Cloud [skip ci]"
+            # O push é permitido graças ao token no step de checkout
             git push
             echo "✅ Changes pushed successfully."
           else
             echo "✅ No changes to commit."
+          fi
           fi
