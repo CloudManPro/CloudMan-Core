@@ -1,13 +1,13 @@
-#CloudMan-Core/.github/workflows/lambda-sync.yml
 name: "CloudMan Engine: Lambda Sync"
 
 on:
-  # Permitir ser chamado por workflows de outros repositórios (Clientes)
+  # Permitir ser chamado por workflows de outros repositórios (Clientes/Executores)
   workflow_call:
     inputs:
+      # 1. Parâmetros de Operação
       direction:
         type: string
-        description: "push (AWS->Git) or pull (Git->AWS)"
+        description: "push (AWS->Git), pull (Git->AWS) or create"
         required: true
       region:
         type: string
@@ -22,35 +22,61 @@ on:
         description: "JSON Array of resources to sync"
         required: true
 
-  # Permitir disparo manual direto (para testes internos)
+      # 2. Parâmetros do Repositório Alvo
+      target_repo:
+        type: string
+        description: "Target Repository (Org/Repo) to sync code with"
+        required: true
+      target_branch:
+        type: string
+        description: "Target Branch"
+        default: "main"
+
+      # 3. Autenticação Automatizada (GitHub App)
+      git_token:
+        type: string
+        description: "App Token passed from backend/listener"
+        required: true
+
+  # Permitir disparo manual direto (para testes internos no Core)
   workflow_dispatch:
     inputs:
       direction:
-        description: "push (AWS->Git) or pull (Git->AWS)"
+        description: "push, pull or create"
         required: true
       region:
-        description: "Default AWS Region"
         default: "us-east-1"
       role_arn:
-        description: "IAM Role to Assume via OIDC"
         required: true
       resources_json:
-        description: "JSON Array of resources to sync"
+        required: true
+      target_repo:
+        required: true
+      target_branch:
+        default: "main"
+      git_token:
         required: true
 
 permissions:
   id-token: write   # Obrigatório para autenticação OIDC AWS
-  contents: write   # Obrigatório para Push no Git (quando direction=push)
+  contents: write   # Obrigatório para Git operations
 
 jobs:
   sync-engine:
     runs-on: ubuntu-latest
     steps:
+      - name: 🛡️ Mask Token
+        # Segurança: Garante que o token não apareça nos logs em texto plano
+        run: echo "::add-mask::${{ inputs.git_token }}"
+
       - name: 📥 Checkout Target Repository
         uses: actions/checkout@v4
         with:
+          # Baixa o repositório definido no input (ex: CloudManPro/CloudMan)
           repository: ${{ inputs.target_repo }}
           ref: ${{ inputs.target_branch }}
+          # Usa o token da App para ter permissão de escrita neste repositório
+          token: ${{ inputs.git_token }}
 
       - name: 🔑 Configure AWS Credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -59,7 +85,7 @@ jobs:
           aws-region: ${{ inputs.region }}
           role-session-name: CloudManSyncSession
 
-      - name: ⚡ Process Resources (CloudMan Engine)
+      - name: ⚡ Process Resources (Node.js Script)
         id: processor
         uses: actions/github-script@v7
         env:
@@ -87,7 +113,8 @@ jobs:
             // Helper: Run Shell Command
             function run(cmd) {
               try {
-                execSync(cmd, { stdio: 'inherit' }); // stdio: inherit mostra logs em tempo real
+                // stdio: inherit mostra logs do comando em tempo real no console do Actions
+                execSync(cmd, { stdio: 'inherit' }); 
               } catch (e) {
                 console.error(`❌ Command failed: ${cmd}`);
                 throw e;
@@ -178,16 +205,18 @@ jobs:
       - name: 📝 Commit Changes (Push/Create Only)
         if: inputs.direction == 'push' || inputs.direction == 'create'
         run: |
+          # Configura o Git com uma identidade genérica de Bot
           git config user.name "CloudMan Bot"
           git config user.email "bot@cloudman.pro"
           
           git add .
           
-          # Commit only if changes exist
+          # Só faz commit se houver mudanças
           if git diff --staged --quiet; then
             echo "✅ No changes to commit."
           else
             git commit -m "cloudman(sync): Sync code from Cloud [skip ci]"
+            # O push usará o token configurado no passo de checkout
             git push
             echo "✅ Changes pushed successfully."
           fi
