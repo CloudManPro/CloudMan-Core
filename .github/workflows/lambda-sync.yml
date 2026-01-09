@@ -236,13 +236,11 @@ jobs:
           
           git add .
           
-          if git diff --staged --quiet; then
-            echo "✅ No changes to commit."
-          else
+          # Verifica se há mudanças no stage (Exit code 1 significa que há diferenças)
+          if ! git diff --staged --quiet; then
             git commit -m "cloudman(sync): Sync code from Cloud [skip ci]"
-            # O push funciona graças ao 'token: inputs.git_token' no checkout
             git push
             echo "✅ Changes pushed successfully."
-          fi
-            echo "✅ Changes pushed successfully."
+          else
+            echo "✅ No changes to commit."
           fi
