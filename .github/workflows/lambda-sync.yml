@@ -2,7 +2,7 @@
 name: "CloudMan Engine: Lambda Sync"
 
 on:
-  # Permite ser chamado por workflows de outros repositórios (Clientes)
+  # Permite ser chamado por workflows de outros repositórios
   workflow_call:
     inputs:
       # 1. Parâmetros de Operação
@@ -39,7 +39,7 @@ on:
         description: "App Token passed from backend/listener"
         required: true
 
-  # Permite disparo manual (para testes)
+  # Permite disparo manual
   workflow_dispatch:
     inputs:
       direction:
@@ -67,7 +67,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 🛡️ Mask Token
-        # Segurança: Oculta o token caso seja impresso nos logs
+        # Segurança: Oculta o token dos logs
         run: echo "::add-mask::${{ inputs.git_token }}"
 
       - name: 📥 Checkout Target Repository
@@ -99,22 +99,22 @@ jobs:
             const { execSync } = require('child_process');
 
             // --- HELPER: DETECT RUNTIME & BOILERPLATE ---
-            function getBoilerplate(runtime) {
+            // Agora recebe o 'baseName' para usar no nome do arquivo
+            function getBoilerplate(runtime, baseName) {
                 const r = (runtime || '').toLowerCase();
 
                 // 1. Python (python3.9, python3.11, etc.)
                 if (r.includes('python')) {
                     return [{
-                        filename: 'lambda_function.py',
+                        filename: `${baseName}.py`, // Ex: MinhaFuncao.py
                         content: `import json\n\ndef lambda_handler(event, context):\n    # TODO: Implement your logic here\n    return {\n        'statusCode': 200,\n        'body': json.dumps('Hello from CloudMan (Python)!')\n    }`
                     }];
                 }
 
                 // 2. Node.js (nodejs18.x, nodejs20.x, etc.)
-                // Verifica 'node' ou 'js' para ser flexível
                 if (r.includes('node') || r.includes('js')) {
                     return [{
-                        filename: 'index.js',
+                        filename: `${baseName}.js`, // Ex: MinhaFuncao.js
                         content: `exports.handler = async (event) => {\n    // TODO: Implement your logic here\n    const response = {\n        statusCode: 200,\n        body: JSON.stringify('Hello from CloudMan (Node.js)!'),\n    };\n    return response;\n};`
                     }];
                 }
@@ -123,11 +123,10 @@ jobs:
                 if (r.includes('ruby')) {
                     return [
                         {
-                            filename: 'lambda_function.rb',
+                            filename: `${baseName}.rb`, // Ex: MinhaFuncao.rb
                             content: `require 'json'\n\ndef lambda_handler(event:, context:)\n    { statusCode: 200, body: JSON.generate('Hello from CloudMan (Ruby)!') }\nend`
                         },
                         {
-                            // Ruby geralmente precisa de Gemfile se usar libs externas
                             filename: 'Gemfile',
                             content: `source 'https://rubygems.org'\n\n# gem 'aws-sdk-s3'`
                         }
@@ -165,7 +164,6 @@ jobs:
                 const funcId = res.function_arn || res.id; 
                 const folder = res.folder_path || res.git_path;
                 const region = res.region || '${{ inputs.region }}';
-                // Captura o runtime, garante string vazia se null
                 const runtime = (res.runtime || '').trim();
 
                 console.log(`\n---------------------------------------------------`);
@@ -182,11 +180,15 @@ jobs:
                         continue;
                     }
                     
-                    // Verifica se o runtime é suportado (Node, Python, Ruby)
-                    const templates = getBoilerplate(runtime);
+                    // Extrai o nome da pasta final para usar como nome do arquivo
+                    // Ex: 'LambdaFiles/MinhaFuncao' -> 'MinhaFuncao'
+                    const baseName = path.basename(folder);
+
+                    // Passa o baseName para a função geradora
+                    const templates = getBoilerplate(runtime, baseName);
 
                     if (!templates) {
-                        console.warn(`⚠️ Skipped: Runtime '${runtime}' is not supported for editable boilerplate (compiled language or unknown).`);
+                        console.warn(`⚠️ Skipped: Runtime '${runtime}' is not supported for editable boilerplate.`);
                         continue;
                     }
                     
@@ -244,7 +246,6 @@ jobs:
           
           git add .
           
-          # Verifica se há algo para comitar (Exit code 1 significa mudanças)
           if ! git diff --staged --quiet; then
             git commit -m "cloudman(sync): Sync code from Cloud [skip ci]"
             # O push é permitido graças ao token no step de checkout
