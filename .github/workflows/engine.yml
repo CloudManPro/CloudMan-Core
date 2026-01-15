@@ -32,8 +32,6 @@ jobs:
       - name: 🚀 Executar Pipeline Híbrido
         shell: bash
         env:
-          # REMOVIDO: ACTIONS_ID_TOKEN_REQUEST_TOKEN (O GitHub já provê internamente para OIDC)
-          # ADICIONADO: Variável específica para o Clone
           GH_CLONE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           LOGIN_REGION: ${{ inputs.default_region || 'us-east-1' }}
         run: |
@@ -49,7 +47,7 @@ jobs:
           NC='\033[0m'
 
           # ==============================================================================
-          # FUNÇÃO 1: Obter Token OIDC (Herdado do seu código antigo)
+          # FUNÇÃO 1: Obter Token OIDC
           # ==============================================================================
           get_oidc_token() {
             local aud="sts.amazonaws.com"
@@ -59,7 +57,7 @@ jobs:
           }
 
           # ==============================================================================
-          # FUNÇÃO 2: Autenticação Dinâmica (Backend Profile vs Target Env)
+          # FUNÇÃO 2: Autenticação Dinâmica
           # ==============================================================================
           authenticate() {
             local role_arn=$1
@@ -67,14 +65,12 @@ jobs:
             local type=$3 # "backend" ou "target"
             local session_name="CloudMan-${type}"
 
-            # 1. Pega Token GitHub
             local jwt=$(get_oidc_token)
             if [ "$jwt" == "null" ] || [ -z "$jwt" ]; then
                 echo "❌ Erro ao obter OIDC Token."
                 return 1
             fi
 
-            # 2. Assume Role na AWS
             local creds=$(aws sts assume-role-with-web-identity \
               --role-arn "$role_arn" \
               --role-session-name "$session_name" \
@@ -93,13 +89,11 @@ jobs:
             local token=$(echo $creds | jq -r '.Credentials.SessionToken')
 
             if [ "$type" == "backend" ]; then
-                # Salva no profile para o Terraform Backend S3 usar
                 aws configure set aws_access_key_id "$key_id" --profile backend
                 aws configure set aws_secret_access_key "$secret" --profile backend
                 aws configure set aws_session_token "$token" --profile backend
                 aws configure set region "$region" --profile backend
             else
-                # Exporta como Env Var para o Provider AWS usar
                 export AWS_ACCESS_KEY_ID="$key_id"
                 export AWS_SECRET_ACCESS_KEY="$secret"
                 export AWS_SESSION_TOKEN="$token"
@@ -108,7 +102,7 @@ jobs:
           }
 
           # ==============================================================================
-          # FUNÇÃO 3: Execução do Terraform (Suporta Logs com Tag)
+          # FUNÇÃO 3: Execução do Terraform
           # ==============================================================================
           run_terraform_process() {
               local path=$1
@@ -117,19 +111,16 @@ jobs:
               local provider=$4
               local label="[$path]"
               
-              # Cor diferente para Azure (visual)
               local color=$BLUE
               if [ "$provider" == "azure" ]; then color=$CYAN; fi
 
               # Cria subshell para isolar variáveis de ambiente do Target
               (
-                  # 1. Autentica no Target (dentro do subshell)
                   if [ "$provider" == "aws" ]; then
                       local t_role=$(echo "$auth_json" | jq -r '.role_arn')
                       local t_region=$(echo "$auth_json" | jq -r '.region')
                       authenticate "$t_role" "$t_region" "target"
                   elif [ "$provider" == "azure" ]; then
-                      # Lógica Azure aqui (export ARM_...)
                       :
                   fi
 
@@ -137,20 +128,17 @@ jobs:
 
                   cd "$path"
                   
-                  # 2. Executa Terraform
-                  # O profile 'backend' já foi configurado globalmente antes
                   terraform init -reconfigure -input=false
 
                   if [ "$action" == "plan" ]; then
                     terraform plan -input=false
                   elif [ "$action" == "apply" ]; then
                     terraform apply -auto-approve -input=false
-                  if [ "$action" == "destroy" ]; then
+                  elif [ "$action" == "destroy" ]; then
                     terraform destroy -auto-approve -input=false
                   fi
               )
 
-              # Retorna o exit code do pipeline (graças ao set -o pipefail)
               return $?
           }
 
@@ -158,7 +146,6 @@ jobs:
           # MAIN: LÓGICA PRINCIPAL
           # ==============================================================================
           
-          # 1. Detecção do Manifesto (Do seu código antigo)
           echo "🔍 Buscando manifest.json..."
           MANIFEST_PATH=$(git diff --name-only HEAD^ HEAD | grep "manifest.json" | head -n 1)
           if [ -z "$MANIFEST_PATH" ]; then
@@ -170,8 +157,7 @@ jobs:
           fi
           echo "✅ Manifesto carregado: $MANIFEST_PATH"
 
-          # 2. Configurações Globais
-          ACTION=$(jq -r '.action // "apply"' "$MANIFEST_PATH") # Default apply se vazio
+          ACTION=$(jq -r '.action // "apply"' "$MANIFEST_PATH")
           BACKEND_ROLE=$(jq -r '.backend_global_config.role_arn' "$MANIFEST_PATH")
           BACKEND_REGION=$(jq -r '.backend_global_config.region' "$MANIFEST_PATH")
 
@@ -179,9 +165,6 @@ jobs:
           echo "🔑 Configurando Backend Profile ($BACKEND_ROLE)..."
           authenticate "$BACKEND_ROLE" "$BACKEND_REGION" "backend"
 
-          # ==============================================================================
-          # NOVO: CLONE DE DEPENDÊNCIAS EXTERNAS (Repo Source-First)
-          # ==============================================================================
           EXTERNAL_REPOS=$(jq -c '.external_repositories // []' "$MANIFEST_PATH")
           
           if [ "$EXTERNAL_REPOS" != "[]" ] && [ "$EXTERNAL_REPOS" != "null" ]; then
@@ -199,10 +182,7 @@ jobs:
                   
                   if [ ! -d "$FULL_TARGET_DIR" ]; then
                       echo "⬇️  Iniciando Sparse-Checkout de $ORG/$REPO_NAME ($BRANCH)..."
-                      
-                      # Clone parcial (apenas metadados)
                       git clone --depth 1 -b "$BRANCH" --filter=blob:none --no-checkout "$REPO_URL" "$FULL_TARGET_DIR"
-                      
                       cd "$FULL_TARGET_DIR"
                       git sparse-checkout init --cone
                       git sparse-checkout set $FOLDERS
@@ -215,11 +195,7 @@ jobs:
               done
           fi
 
-
-
-          # 3. Loop pelos Estágios
           TOTAL_STAGES=$(jq '.pipeline_stages | length' "$MANIFEST_PATH")
-
 
           for (( i=0; i<$TOTAL_STAGES; i++ )); do
               STAGE_NAME=$(jq -r ".pipeline_stages[$i].stage_name" "$MANIFEST_PATH")
@@ -241,28 +217,20 @@ jobs:
                        continue
                   fi
 
-                  # [NOVO] CRIA SYMLINK PARA MÓDULOS EXTERNOS
-                  # O Terraform espera achar .external_modules dentro de $path
-                  # O Clone baixou em ./.external_modules (raiz)
                   if [ -d ".external_modules" ]; then
                       ABS_EXT_MOD=$(readlink -f .external_modules)
-                      # Cria link simbólico (-s) forçado (-f) e sem dereferenciar destino se for link (-n)
                       ln -sfn "$ABS_EXT_MOD" "$path/.external_modules"
                   fi
 
                   if [ "$IS_PARALLEL" == "true" ]; then
-                      # Roda em background
                       run_terraform_process "$path" "$ACTION" "$target_auth" "$provider" &
                       pids="$pids $!"
                   else
-                      # Roda sequencial
                       run_terraform_process "$path" "$ACTION" "$target_auth" "$provider"
                       if [ $? -ne 0 ]; then failed=1; break; fi
                   fi
               done <<< "$STATES_JSON"
 
-
-              # Se paralelo, aguarda todos
               if [ "$IS_PARALLEL" == "true" ]; then
                   for pid in $pids; do
                       wait $pid
