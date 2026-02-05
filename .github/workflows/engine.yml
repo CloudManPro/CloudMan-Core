@@ -122,9 +122,17 @@ jobs:
                   
                   # Cloudflare handling
                   if [ "$provider" == "cloudflare" ]; then
-                      local acc_id=$(echo "$auth_json" | jq -r '.account_id')
-                      local secret_key="AUTH_CLOUDFLARE_${acc_id}"
+                      local raw_id=$(echo "$auth_json" | jq -r '.account_id')
+                      
+                      # ALGORITMO DE CORREÇÃO (JS Port):
+                      # 1. Substitui tudo que NÃO for alfanumérico por "_" (sed)
+                      # 2. Converte para MAIÚSCULO (tr)
+                      local sanitized_id=$(echo "$raw_id" | sed 's/[^a-zA-Z0-9]/_/g' | tr '[:lower:]' '[:upper:]')
+                      
+                      local secret_key="AUTH_CLOUDFLARE_${sanitized_id}"
+                      
                       local token=$(echo "$SECRETS_CONTEXT" | jq -r --arg key "$secret_key" '.[$key]')
+
                       if [ "$token" == "null" ] || [ -z "$token" ]; then
                           echo "❌ Erro: Secret '$secret_key' não encontrado."
                           exit 1
