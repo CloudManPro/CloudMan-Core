@@ -43,7 +43,6 @@ jobs:
         env:
           GH_CLONE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           LOGIN_REGION: ${{ inputs.default_region || 'us-east-1' }}
-          # MÁGICA: Passamos todos os secrets como JSON para permitir busca dinâmica
           SECRETS_CONTEXT: ${{ toJSON(secrets) }}
         run: |
           # ==============================================================================
@@ -57,19 +56,15 @@ jobs:
           RED='\033[0;31m'
           NC='\033[0m'
 
-          # Configura caminhos dos scripts modulares
           ENGINE_PATH=$(readlink -f .cloudman-engine)
           AUTH_SCRIPTS="$ENGINE_PATH/scripts/auth"
           
           if [ ! -d "$AUTH_SCRIPTS" ]; then
               echo "❌ Erro Crítico: Pasta scripts/auth não encontrada em $ENGINE_PATH"
-              echo "Certifique-se de que os arquivos .sh foram commitados no repo cloudman-core."
               exit 1
           fi
           
           chmod +x $AUTH_SCRIPTS/*.sh
-
-          # Carrega funções utilitárias e AWS (Backend sempre precisa de AWS)
           source "$AUTH_SCRIPTS/aws.sh"
 
           # ==============================================================================
@@ -95,28 +90,30 @@ jobs:
                   # ---------------------------------------------------------
                   # PASSO 1: TERRAFORM INIT (Usando Credenciais de BACKEND)
                   # ---------------------------------------------------------
-                  # Aqui garantimos que o Terraform use o profile 'backend' configurado
-                  # no início do script para acessar o S3/DynamoDB, sem interferência
-                  # das credenciais do Target (que ainda não foram carregadas).
-                  
                   echo -e "${color}▶️ ${label} Inicializando Backend (State)...${NC}"
                   
-                  # Remove vars de ambiente que possam conflitar
-                  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION
+                  # 1. Limpa credenciais explícitas para garantir uso do Profile
+                  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
                   
-                  # Força o uso do profile configurado via 'aws configure --profile backend'
+                  # 2. Força o Profile de Backend configurado anteriormente
                   export AWS_PROFILE=backend
+                  
+                  # 3. CORREÇÃO CRÍTICA: Força a região do Backend explicitamente.
+                  # Sem isso, o Terraform pode tentar buscar o DynamoDB na região default do Runner.
+                  if [ -n "$BACKEND_REGION" ]; then
+                      export AWS_REGION="$BACKEND_REGION"
+                  fi
                   
                   terraform init -reconfigure -input=false
                   
-                  # Remove o profile para não forçar o backend durante o apply
+                  # 4. Limpeza pós-init: Remove Profile e Region para não poluir o Target
                   unset AWS_PROFILE
+                  unset AWS_REGION
 
                   # ---------------------------------------------------------
                   # PASSO 2: PREPARAÇÃO DO TARGET (Autenticação do Provider)
                   # ---------------------------------------------------------
                   
-                  # Caso especial: Cloudflare (Secrets Dinâmicos)
                   if [ "$provider" == "cloudflare" ]; then
                       local acc_id=$(echo "$auth_json" | jq -r '.account_id')
                       local secret_key="AUTH_CLOUDFLARE_${acc_id}"
@@ -129,17 +126,15 @@ jobs:
                       export CLOUDFLARE_API_TOKEN="$token"
                   fi
                   
-                  # Autenticação Padrão via Script (AWS, Azure, OCI, etc)
                   local script_file="$AUTH_SCRIPTS/${provider}.sh"
                   
                   if [ -f "$script_file" ]; then
-                      # Carrega e executa a função específica do provedor
-                      # Isso vai EXPORTAR as variáveis (ex: AWS_ACCESS_KEY_ID) do TARGET
+                      # Carrega credenciais do TARGET (Isso vai re-definir AWS_REGION se for AWS)
                       source "$script_file"
                       "auth_${provider}" "$auth_json" "target"
                   else
                       if [ "$provider" != "cloudflare" ]; then
-                           echo "⚠️  Aviso: Script de autenticação para '$provider' não encontrado. Tentando execução direta."
+                           echo "⚠️  Aviso: Script de autenticação para '$provider' não encontrado."
                       fi
                   fi
 
@@ -176,18 +171,17 @@ jobs:
           echo "✅ Manifesto carregado: $MANIFEST_PATH"
 
           ACTION=$(jq -r '.action // "apply"' "$MANIFEST_PATH")
-          BACKEND_ROLE=$(jq -r '.backend_global_config.role_arn' "$MANIFEST_PATH")
-          BACKEND_REGION=$(jq -r '.backend_global_config.region' "$MANIFEST_PATH")
+          # Variáveis globais usadas dentro da função run_terraform_process
+          export BACKEND_ROLE=$(jq -r '.backend_global_config.role_arn' "$MANIFEST_PATH")
+          export BACKEND_REGION=$(jq -r '.backend_global_config.region' "$MANIFEST_PATH")
 
           echo "⚡ Ação Global: $ACTION"
           echo "🔑 Configurando Backend Profile (AWS S3/DynamoDB)..."
           
-          # Chama a função auth_aws importada de aws.sh para o Backend
-          # Isso cria o profile 'backend' no arquivo ~/.aws/credentials
           auth_aws "{\"role_arn\": \"$BACKEND_ROLE\", \"region\": \"$BACKEND_REGION\"}" "backend"
 
           # ---------------------------------------------------------
-          # DEPENDÊNCIAS EXTERNAS (Sparse Checkout)
+          # DEPENDÊNCIAS EXTERNAS
           # ---------------------------------------------------------
           EXTERNAL_REPOS=$(jq -c '.external_repositories // []' "$MANIFEST_PATH")
           
@@ -237,14 +231,13 @@ jobs:
               while read -r state; do
                   path=$(echo "$state" | jq -r '.path')
                   provider=$(echo "$state" | jq -r '.provider')
-                  target_auth=$(echo "$state" | jq -c '.target_auth') # jq -c para manter JSON
+                  target_auth=$(echo "$state" | jq -c '.target_auth')
                   
                   if [ ! -d "$path" ]; then
                        echo "⚠️  Diretório $path não existe. Pulando."
                        continue
                   fi
 
-                  # Link para módulos externos se existirem
                   if [ -d ".external_modules" ]; then
                       ABS_EXT_MOD=$(readlink -f .external_modules)
                       ln -sfn "$ABS_EXT_MOD" "$path/.external_modules"
