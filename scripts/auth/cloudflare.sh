@@ -5,11 +5,13 @@ function auth_cloudflare() {
     echo "☁️ Autenticando Cloudflare dinamicamente..."
 
     # 1. Extrai o ID da conta do manifesto
-    local account_id=$(echo "$auth_json" | jq -r '.account_id')
+    local raw_id=$(echo "$auth_json" | jq -r '.account_id')
 
-    # 2. Monta o nome esperado da variável de ambiente
-    # Ex: AUTH_CLOUDFLARE_bf9638139fc9b9a92fa0334ae15ac3ac
-    local expected_var_name="AUTH_CLOUDFLARE_${account_id}"
+    # 2. Aplica a sanitização (Regex [^a-zA-Z0-9] -> _) e Uppercase
+    local sanitized_id=$(echo "$raw_id" | sed 's/[^a-zA-Z0-9]/_/g' | tr '[:lower:]' '[:upper:]')
+
+    # 3. Monta o nome esperado da variável de ambiente
+    local expected_var_name="AUTH_CLOUDFLARE_${sanitized_id}"
 
     # 3. Pega o valor da variável cujo nome está em $expected_var_name
     local token_value="${!expected_var_name}"
