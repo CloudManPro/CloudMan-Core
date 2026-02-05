@@ -1,5 +1,6 @@
 #!/bin/bash
-source $(dirname "$0")/utils.sh
+# A correção está na linha abaixo: BASH_SOURCE[0] em vez de $0
+source $(dirname "${BASH_SOURCE[0]}")/utils.sh
 
 function auth_aws() {
     local auth_json=$1
@@ -11,7 +12,6 @@ function auth_aws() {
     local region=$(echo "$auth_json" | jq -r '.region')
     local session_name="CloudMan-${type}"
 
-    # Reutiliza função do utils.sh
     local jwt=$(get_github_oidc_token "sts.amazonaws.com")
 
     local creds=$(aws sts assume-role-with-web-identity \
@@ -31,7 +31,6 @@ function auth_aws() {
     export AWS_SESSION_TOKEN="$token"
     export AWS_REGION="$region"
     
-    # Se for backend, configura profile também
     if [ "$type" == "backend" ]; then
         aws configure set aws_access_key_id "$key_id" --profile backend
         aws configure set aws_secret_access_key "$secret" --profile backend
