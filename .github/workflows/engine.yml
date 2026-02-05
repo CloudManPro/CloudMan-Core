@@ -122,15 +122,15 @@ jobs:
                   
                   # Cloudflare handling
                   if [ "$provider" == "cloudflare" ]; then
-                      local raw_id=$(echo "$auth_json" | jq -r '.account_id')
+                      # Prioriza o secret_name vindo do manifest, se não existir, usa o fallback antigo
+                      local secret_key=$(echo "$auth_json" | jq -r '.secret_name // empty')
                       
-                      # ALGORITMO DE CORREÇÃO (JS Port):
-                      # 1. Substitui tudo que NÃO for alfanumérico por "_" (sed)
-                      # 2. Converte para MAIÚSCULO (tr)
-                      local sanitized_id=$(echo "$raw_id" | sed 's/[^a-zA-Z0-9]/_/g' | tr '[:lower:]' '[:upper:]')
-                      
-                      local secret_key="AUTH_CLOUDFLARE_${sanitized_id}"
-                      
+                      if [ -z "$secret_key" ]; then
+                          local acc_id=$(echo "$auth_json" | jq -r '.account_id')
+                          secret_key="AUTH_CLOUDFLARE_${acc_id}"
+                      fi
+                  
+                      echo "🔑 Buscando Secret: $secret_key"
                       local token=$(echo "$SECRETS_CONTEXT" | jq -r --arg key "$secret_key" '.[$key]')
 
                       if [ "$token" == "null" ] || [ -z "$token" ]; then
