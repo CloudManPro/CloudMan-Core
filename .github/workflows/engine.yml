@@ -21,21 +21,31 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: 📥 Checkout
+      # 1. Checkout do Código do Cliente
+      - name: 📥 Checkout Client Code
         uses: actions/checkout@v4
         with:
           fetch-depth: 2
 
+      # 2. Checkout do Engine (Para carregar os scripts .sh)
+      - name: 📥 Checkout CloudMan Engine
+        uses: actions/checkout@v4
+        with:
+          repository: CloudManPro/cloudman-core
+          path: .cloudman-engine
+          ref: main
+
       - name: 🛠️ Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
-      - name: 🚀 Executar Pipeline Híbrido
+      - name: 🚀 Executar Pipeline Modular
         shell: bash
         env:
           GH_CLONE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           LOGIN_REGION: ${{ inputs.default_region || 'us-east-1' }}
+          # MÁGICA: Passamos todos os secrets como JSON para permitir busca dinâmica
+          SECRETS_CONTEXT: ${{ toJSON(secrets) }}
         run: |
-
           # ==============================================================================
           # CONFIGURAÇÕES E CORES
           # ==============================================================================
@@ -43,66 +53,27 @@ jobs:
           BLUE='\033[0;34m'
           CYAN='\033[0;36m'
           GREEN='\033[0;32m'
+          YELLOW='\033[0;33m'
           RED='\033[0;31m'
           NC='\033[0m'
 
-          # ==============================================================================
-          # FUNÇÃO 1: Obter Token OIDC
-          # ==============================================================================
-          get_oidc_token() {
-            local aud="sts.amazonaws.com"
-            local token_url="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${aud}"
-            response=$(curl -s -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "$token_url")
-            echo $response | jq -r '.value'
-          }
+          # Configura caminhos dos scripts modulares
+          ENGINE_PATH=$(readlink -f .cloudman-engine)
+          AUTH_SCRIPTS="$ENGINE_PATH/scripts/auth"
+          
+          if [ ! -d "$AUTH_SCRIPTS" ]; then
+              echo "❌ Erro Crítico: Pasta scripts/auth não encontrada em $ENGINE_PATH"
+              echo "Certifique-se de que os arquivos .sh foram commitados no repo cloudman-core."
+              exit 1
+          fi
+          
+          chmod +x $AUTH_SCRIPTS/*.sh
+
+          # Carrega funções utilitárias e AWS (Backend sempre precisa de AWS)
+          source "$AUTH_SCRIPTS/aws.sh"
 
           # ==============================================================================
-          # FUNÇÃO 2: Autenticação Dinâmica
-          # ==============================================================================
-          authenticate() {
-            local role_arn=$1
-            local region=$2
-            local type=$3 # "backend" ou "target"
-            local session_name="CloudMan-${type}"
-
-            local jwt=$(get_oidc_token)
-            if [ "$jwt" == "null" ] || [ -z "$jwt" ]; then
-                echo "❌ Erro ao obter OIDC Token."
-                return 1
-            fi
-
-            local creds=$(aws sts assume-role-with-web-identity \
-              --role-arn "$role_arn" \
-              --role-session-name "$session_name" \
-              --web-identity-token "$jwt" \
-              --duration-seconds 900 \
-              --region "$region" \
-              --output json)
-
-            if [ $? -ne 0 ]; then
-               echo "❌ Erro ao assumir role $role_arn"
-               return 1
-            fi
-
-            local key_id=$(echo $creds | jq -r '.Credentials.AccessKeyId')
-            local secret=$(echo $creds | jq -r '.Credentials.SecretAccessKey')
-            local token=$(echo $creds | jq -r '.Credentials.SessionToken')
-
-            if [ "$type" == "backend" ]; then
-                aws configure set aws_access_key_id "$key_id" --profile backend
-                aws configure set aws_secret_access_key "$secret" --profile backend
-                aws configure set aws_session_token "$token" --profile backend
-                aws configure set region "$region" --profile backend
-            else
-                export AWS_ACCESS_KEY_ID="$key_id"
-                export AWS_SECRET_ACCESS_KEY="$secret"
-                export AWS_SESSION_TOKEN="$token"
-                export AWS_REGION="$region"
-            fi
-          }
-
-          # ==============================================================================
-          # FUNÇÃO 3: Execução do Terraform
+          # FUNÇÃO PRINCIPAL: Execução do Terraform
           # ==============================================================================
           run_terraform_process() {
               local path=$1
@@ -113,17 +84,51 @@ jobs:
               
               local color=$BLUE
               if [ "$provider" == "azure" ]; then color=$CYAN; fi
+              if [ "$provider" == "cloudflare" ]; then color=$GREEN; fi
+              if [ "$provider" == "google" ]; then color=$YELLOW; fi
+              if [ "$provider" == "oci" ]; then color=$RED; fi
 
-              # Cria subshell para isolar variáveis de ambiente do Target
+              # Cria subshell para isolar variáveis de ambiente
               (
-                  if [ "$provider" == "aws" ]; then
-                      local t_role=$(echo "$auth_json" | jq -r '.role_arn')
-                      local t_region=$(echo "$auth_json" | jq -r '.region')
-                      authenticate "$t_role" "$t_region" "target"
-                  elif [ "$provider" == "azure" ]; then
-                      :
+                  # ---------------------------------------------------------
+                  # PRÉ-PROCESSAMENTO DE SECRETS DINÂMICOS (CLOUDFLARE)
+                  # ---------------------------------------------------------
+                  if [ "$provider" == "cloudflare" ]; then
+                      # 1. Lê o ID da conta do manifesto
+                      local acc_id=$(echo "$auth_json" | jq -r '.account_id')
+                      
+                      # 2. Monta o nome do Secret esperado (Convenção)
+                      local secret_key="AUTH_CLOUDFLARE_${acc_id}"
+                      
+                      # 3. Extrai o valor do JSON de Contexto de Secrets
+                      # Isso evita ter que usar 'eval' inseguro
+                      local token=$(echo "$SECRETS_CONTEXT" | jq -r --arg key "$secret_key" '.[$key]')
+                      
+                      if [ "$token" == "null" ] || [ -z "$token" ]; then
+                          echo "❌ Erro: Secret '$secret_key' não encontrado para a conta $acc_id."
+                          exit 1
+                      fi
+                      
+                      # 4. Exporta para o script de autenticação consumir
+                      export CLOUDFLARE_API_TOKEN="$token"
+                  fi
+                  
+                  # ---------------------------------------------------------
+                  # ORQUESTRADOR DE AUTENTICAÇÃO
+                  # ---------------------------------------------------------
+                  local script_file="$AUTH_SCRIPTS/${provider}.sh"
+                  
+                  if [ -f "$script_file" ]; then
+                      # Carrega e executa a função específica do provedor
+                      source "$script_file"
+                      "auth_${provider}" "$auth_json" "target"
+                  else
+                      echo "⚠️  Aviso: Script de autenticação para '$provider' não encontrado. Tentando execução direta."
                   fi
 
+                  # ---------------------------------------------------------
+                  # EXECUÇÃO DO TERRAFORM
+                  # ---------------------------------------------------------
                   echo -e "${color}▶️ ${label} Iniciando Terraform $action...${NC}"
 
                   cd "$path"
@@ -143,7 +148,7 @@ jobs:
           }
 
           # ==============================================================================
-          # MAIN: LÓGICA PRINCIPAL
+          # MAIN: LÓGICA PRINCIPAL (LEITURA DO MANIFESTO)
           # ==============================================================================
           
           echo "🔍 Buscando manifest.json..."
@@ -162,9 +167,14 @@ jobs:
           BACKEND_REGION=$(jq -r '.backend_global_config.region' "$MANIFEST_PATH")
 
           echo "⚡ Ação Global: $ACTION"
-          echo "🔑 Configurando Backend Profile ($BACKEND_ROLE)..."
-          authenticate "$BACKEND_ROLE" "$BACKEND_REGION" "backend"
+          echo "🔑 Configurando Backend Profile (AWS S3/DynamoDB)..."
+          
+          # Chama a função auth_aws importada de aws.sh para o Backend
+          auth_aws "{\"role_arn\": \"$BACKEND_ROLE\", \"region\": \"$BACKEND_REGION\"}" "backend"
 
+          # ---------------------------------------------------------
+          # DEPENDÊNCIAS EXTERNAS (Sparse Checkout)
+          # ---------------------------------------------------------
           EXTERNAL_REPOS=$(jq -c '.external_repositories // []' "$MANIFEST_PATH")
           
           if [ "$EXTERNAL_REPOS" != "[]" ] && [ "$EXTERNAL_REPOS" != "null" ]; then
@@ -195,6 +205,9 @@ jobs:
               done
           fi
 
+          # ---------------------------------------------------------
+          # EXECUÇÃO DOS ESTÁGIOS
+          # ---------------------------------------------------------
           TOTAL_STAGES=$(jq '.pipeline_stages | length' "$MANIFEST_PATH")
 
           for (( i=0; i<$TOTAL_STAGES; i++ )); do
@@ -210,13 +223,14 @@ jobs:
               while read -r state; do
                   path=$(echo "$state" | jq -r '.path')
                   provider=$(echo "$state" | jq -r '.provider')
-                  target_auth=$(echo "$state" | jq -r '.target_auth')
+                  target_auth=$(echo "$state" | jq -c '.target_auth') # jq -c para manter JSON
                   
                   if [ ! -d "$path" ]; then
                        echo "⚠️  Diretório $path não existe. Pulando."
                        continue
                   fi
 
+                  # Link para módulos externos se existirem
                   if [ -d ".external_modules" ]; then
                       ABS_EXT_MOD=$(readlink -f .external_modules)
                       ln -sfn "$ABS_EXT_MOD" "$path/.external_modules"
