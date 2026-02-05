@@ -1,5 +1,6 @@
 #!/bin/bash
-source $(dirname "$0")/utils.sh
+# Correção aqui também
+source $(dirname "${BASH_SOURCE[0]}")/utils.sh
 
 function auth_google() {
     local auth_json=$1
@@ -8,7 +9,6 @@ function auth_google() {
     local wif_provider=$(echo "$auth_json" | jq -r '.workload_identity_provider')
     local service_account=$(echo "$auth_json" | jq -r '.service_account')
     
-    # A aud do Google é o próprio pool
     local audience="//iam.googleapis.com/${wif_provider}"
     local jwt=$(get_github_oidc_token "$audience")
     
