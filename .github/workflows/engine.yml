@@ -21,13 +21,11 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      # 1. Checkout do Código do Cliente
       - name: 📥 Checkout Client Code
         uses: actions/checkout@v4
         with:
           fetch-depth: 2
 
-      # 2. Checkout do Engine (Para carregar os scripts .sh)
       - name: 📥 Checkout CloudMan Engine
         uses: actions/checkout@v4
         with:
@@ -60,12 +58,26 @@ jobs:
           AUTH_SCRIPTS="$ENGINE_PATH/scripts/auth"
           
           if [ ! -d "$AUTH_SCRIPTS" ]; then
-              echo "❌ Erro Crítico: Pasta scripts/auth não encontrada em $ENGINE_PATH"
+              echo "❌ Erro Crítico: Pasta scripts/auth não encontrada"
               exit 1
           fi
           
           chmod +x $AUTH_SCRIPTS/*.sh
           source "$AUTH_SCRIPTS/aws.sh"
+
+          # ==============================================================================
+          # FUNÇÃO DE LOG DE DEBUG
+          # ==============================================================================
+          debug_auth_status() {
+              local context=$1
+              echo "🔎 [DEBUG] Verificando identidade ($context):"
+              if [ -n "$AWS_PROFILE" ]; then echo "   - AWS_PROFILE: $AWS_PROFILE"; else echo "   - AWS_PROFILE: (unset)"; fi
+              if [ -n "$AWS_REGION" ]; then echo "   - AWS_REGION: $AWS_REGION"; else echo "   - AWS_REGION: (unset)"; fi
+              
+              # Verifica identidade real (se tiver credenciais carregadas)
+              aws sts get-caller-identity --query "Arn" --output text 2>/dev/null || echo "   - (Sem credenciais ativas no terminal)"
+              echo "---------------------------------------------------"
+          }
 
           # ==============================================================================
           # FUNÇÃO PRINCIPAL: Execução do Terraform
@@ -83,44 +95,38 @@ jobs:
               if [ "$provider" == "google" ]; then color=$YELLOW; fi
               if [ "$provider" == "oci" ]; then color=$RED; fi
 
-              # Cria subshell para isolar variáveis de ambiente
               (
                   cd "$path"
 
                   # ---------------------------------------------------------
-                  # PASSO 1: TERRAFORM INIT (Usando Credenciais de BACKEND)
+                  # PASSO 1: TERRAFORM INIT
                   # ---------------------------------------------------------
                   echo -e "${color}▶️ ${label} Inicializando Backend (State)...${NC}"
                   
-                  # 1. Limpa credenciais explícitas para garantir uso do Profile
-                  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+                  # Limpa ambiente para garantir que o Init use apenas o profile
+                  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION
+
+                  # SOLUÇÃO DO PROBLEMA DE LOCK:
+                  # Injetamos '-backend-config="profile=backend"'
+                  # Isso força o Terraform a salvar no .terraform/terraform.tfstate que
+                  # ele DEVE usar o profile 'backend' para operações de estado (S3/Dynamo),
+                  # ignorando as variáveis de ambiente que vamos carregar no passo 2.
                   
-                  # 2. Força o Profile de Backend configurado anteriormente
-                  export AWS_PROFILE=backend
-                  
-                  # 3. CORREÇÃO CRÍTICA: Força a região do Backend explicitamente.
-                  # Sem isso, o Terraform pode tentar buscar o DynamoDB na região default do Runner.
-                  if [ -n "$BACKEND_REGION" ]; then
-                      export AWS_REGION="$BACKEND_REGION"
-                  fi
-                  
-                  terraform init -reconfigure -input=false
-                  
-                  # 4. Limpeza pós-init: Remove Profile e Region para não poluir o Target
-                  unset AWS_PROFILE
-                  unset AWS_REGION
+                  terraform init -reconfigure -input=false \
+                      -backend-config="profile=backend" \
+                      -backend-config="region=$BACKEND_REGION"
 
                   # ---------------------------------------------------------
-                  # PASSO 2: PREPARAÇÃO DO TARGET (Autenticação do Provider)
+                  # PASSO 2: PREPARAÇÃO DO TARGET
                   # ---------------------------------------------------------
                   
+                  # Cloudflare handling
                   if [ "$provider" == "cloudflare" ]; then
                       local acc_id=$(echo "$auth_json" | jq -r '.account_id')
                       local secret_key="AUTH_CLOUDFLARE_${acc_id}"
                       local token=$(echo "$SECRETS_CONTEXT" | jq -r --arg key "$secret_key" '.[$key]')
-                      
                       if [ "$token" == "null" ] || [ -z "$token" ]; then
-                          echo "❌ Erro: Secret '$secret_key' não encontrado para a conta $acc_id."
+                          echo "❌ Erro: Secret '$secret_key' não encontrado."
                           exit 1
                       fi
                       export CLOUDFLARE_API_TOKEN="$token"
@@ -129,9 +135,14 @@ jobs:
                   local script_file="$AUTH_SCRIPTS/${provider}.sh"
                   
                   if [ -f "$script_file" ]; then
-                      # Carrega credenciais do TARGET (Isso vai re-definir AWS_REGION se for AWS)
+                      echo "🔶 Autenticando $provider (target)..."
                       source "$script_file"
                       "auth_${provider}" "$auth_json" "target"
+                      
+                      # Debug: Mostra que agora estamos logados como TARGET
+                      if [ "$provider" == "aws" ]; then
+                          debug_auth_status "TARGET AUTH"
+                      fi
                   else
                       if [ "$provider" != "cloudflare" ]; then
                            echo "⚠️  Aviso: Script de autenticação para '$provider' não encontrado."
@@ -139,10 +150,15 @@ jobs:
                   fi
 
                   # ---------------------------------------------------------
-                  # PASSO 3: EXECUÇÃO DO TERRAFORM (Plan/Apply)
+                  # PASSO 3: EXECUÇÃO DO TERRAFORM
                   # ---------------------------------------------------------
                   echo -e "${color}▶️ ${label} Executando Terraform $action...${NC}"
 
+                  # Como configuramos o backend com profile=backend no init,
+                  # o Terraform vai usar:
+                  # 1. Profile 'backend' -> Para S3 e DynamoDB (Lock)
+                  # 2. Env Vars (AWS_ACCESS_KEY...) -> Para o Provider AWS (Resources)
+                  
                   if [ "$action" == "plan" ]; then
                     terraform plan -input=false
                   elif [ "$action" == "apply" ]; then
@@ -156,7 +172,7 @@ jobs:
           }
 
           # ==============================================================================
-          # MAIN: LÓGICA PRINCIPAL (LEITURA DO MANIFESTO)
+          # MAIN
           # ==============================================================================
           
           echo "🔍 Buscando manifest.json..."
@@ -171,35 +187,35 @@ jobs:
           echo "✅ Manifesto carregado: $MANIFEST_PATH"
 
           ACTION=$(jq -r '.action // "apply"' "$MANIFEST_PATH")
-          # Variáveis globais usadas dentro da função run_terraform_process
+          
+          # Exporta para ser visível dentro do subshell do terraform init
           export BACKEND_ROLE=$(jq -r '.backend_global_config.role_arn' "$MANIFEST_PATH")
           export BACKEND_REGION=$(jq -r '.backend_global_config.region' "$MANIFEST_PATH")
 
           echo "⚡ Ação Global: $ACTION"
-          echo "🔑 Configurando Backend Profile (AWS S3/DynamoDB)..."
+          echo "🔑 Configurando Backend Profile..."
           
+          # Cria o profile [backend] em ~/.aws/credentials
           auth_aws "{\"role_arn\": \"$BACKEND_ROLE\", \"region\": \"$BACKEND_REGION\"}" "backend"
+          debug_auth_status "BACKEND PROFILE CRIADO"
 
           # ---------------------------------------------------------
           # DEPENDÊNCIAS EXTERNAS
           # ---------------------------------------------------------
           EXTERNAL_REPOS=$(jq -c '.external_repositories // []' "$MANIFEST_PATH")
-          
           if [ "$EXTERNAL_REPOS" != "[]" ] && [ "$EXTERNAL_REPOS" != "null" ]; then
               echo "📦 Analisando dependências externas..."
-              
               echo "$EXTERNAL_REPOS" | jq -c '.[]' | while read -r repo; do
                   REPO_NAME=$(echo "$repo" | jq -r '.repo_name')
                   ORG=$(echo "$repo" | jq -r '.org')
                   BRANCH=$(echo "$repo" | jq -r '.branch')
                   TARGET_DIR=$(echo "$repo" | jq -r '.target_dir')
                   FOLDERS=$(echo "$repo" | jq -r '.folders | join(" ")')
-                  
                   FULL_TARGET_DIR="./$TARGET_DIR"
                   REPO_URL="https://x-access-token:${GH_CLONE_TOKEN}@github.com/${ORG}/${REPO_NAME}.git"
                   
                   if [ ! -d "$FULL_TARGET_DIR" ]; then
-                      echo "⬇️  Iniciando Sparse-Checkout de $ORG/$REPO_NAME ($BRANCH)..."
+                      echo "⬇️  Iniciando Sparse-Checkout de $ORG/$REPO_NAME..."
                       git clone --depth 1 -b "$BRANCH" --filter=blob:none --no-checkout "$REPO_URL" "$FULL_TARGET_DIR"
                       cd "$FULL_TARGET_DIR"
                       git sparse-checkout init --cone
@@ -223,7 +239,7 @@ jobs:
               IS_PARALLEL=$(jq -r ".pipeline_stages[$i].parallel_execution" "$MANIFEST_PATH")
               STATES_JSON=$(jq -c ".pipeline_stages[$i].states[]" "$MANIFEST_PATH")
 
-              echo "::group::🚀 Estágio: $STAGE_NAME (Paralelo: $IS_PARALLEL)"
+              echo "::group::🚀 Estágio: $STAGE_NAME"
 
               pids=""
               failed=0
@@ -237,10 +253,8 @@ jobs:
                        echo "⚠️  Diretório $path não existe. Pulando."
                        continue
                   fi
-
                   if [ -d ".external_modules" ]; then
-                      ABS_EXT_MOD=$(readlink -f .external_modules)
-                      ln -sfn "$ABS_EXT_MOD" "$path/.external_modules"
+                      ln -sfn "$(readlink -f .external_modules)" "$path/.external_modules"
                   fi
 
                   if [ "$IS_PARALLEL" == "true" ]; then
@@ -260,11 +274,9 @@ jobs:
               fi
 
               if [ $failed -ne 0 ]; then
-                  echo "::error::Falha na execução do estágio $STAGE_NAME"
+                  echo "::error::Falha no estágio $STAGE_NAME"
                   exit 1
               fi
-
               echo "::endgroup::"
           done
-
-          echo "✅ Pipeline finalizado com sucesso."
+          echo "✅ Pipeline finalizado."
