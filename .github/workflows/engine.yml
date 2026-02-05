@@ -90,50 +90,63 @@ jobs:
 
               # Cria subshell para isolar variáveis de ambiente
               (
+                  cd "$path"
+
                   # ---------------------------------------------------------
-                  # PRÉ-PROCESSAMENTO DE SECRETS DINÂMICOS (CLOUDFLARE)
+                  # PASSO 1: TERRAFORM INIT (Usando Credenciais de BACKEND)
                   # ---------------------------------------------------------
+                  # Aqui garantimos que o Terraform use o profile 'backend' configurado
+                  # no início do script para acessar o S3/DynamoDB, sem interferência
+                  # das credenciais do Target (que ainda não foram carregadas).
+                  
+                  echo -e "${color}▶️ ${label} Inicializando Backend (State)...${NC}"
+                  
+                  # Remove vars de ambiente que possam conflitar
+                  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION
+                  
+                  # Força o uso do profile configurado via 'aws configure --profile backend'
+                  export AWS_PROFILE=backend
+                  
+                  terraform init -reconfigure -input=false
+                  
+                  # Remove o profile para não forçar o backend durante o apply
+                  unset AWS_PROFILE
+
+                  # ---------------------------------------------------------
+                  # PASSO 2: PREPARAÇÃO DO TARGET (Autenticação do Provider)
+                  # ---------------------------------------------------------
+                  
+                  # Caso especial: Cloudflare (Secrets Dinâmicos)
                   if [ "$provider" == "cloudflare" ]; then
-                      # 1. Lê o ID da conta do manifesto
                       local acc_id=$(echo "$auth_json" | jq -r '.account_id')
-                      
-                      # 2. Monta o nome do Secret esperado (Convenção)
                       local secret_key="AUTH_CLOUDFLARE_${acc_id}"
-                      
-                      # 3. Extrai o valor do JSON de Contexto de Secrets
-                      # Isso evita ter que usar 'eval' inseguro
                       local token=$(echo "$SECRETS_CONTEXT" | jq -r --arg key "$secret_key" '.[$key]')
                       
                       if [ "$token" == "null" ] || [ -z "$token" ]; then
                           echo "❌ Erro: Secret '$secret_key' não encontrado para a conta $acc_id."
                           exit 1
                       fi
-                      
-                      # 4. Exporta para o script de autenticação consumir
                       export CLOUDFLARE_API_TOKEN="$token"
                   fi
                   
-                  # ---------------------------------------------------------
-                  # ORQUESTRADOR DE AUTENTICAÇÃO
-                  # ---------------------------------------------------------
+                  # Autenticação Padrão via Script (AWS, Azure, OCI, etc)
                   local script_file="$AUTH_SCRIPTS/${provider}.sh"
                   
                   if [ -f "$script_file" ]; then
                       # Carrega e executa a função específica do provedor
+                      # Isso vai EXPORTAR as variáveis (ex: AWS_ACCESS_KEY_ID) do TARGET
                       source "$script_file"
                       "auth_${provider}" "$auth_json" "target"
                   else
-                      echo "⚠️  Aviso: Script de autenticação para '$provider' não encontrado. Tentando execução direta."
+                      if [ "$provider" != "cloudflare" ]; then
+                           echo "⚠️  Aviso: Script de autenticação para '$provider' não encontrado. Tentando execução direta."
+                      fi
                   fi
 
                   # ---------------------------------------------------------
-                  # EXECUÇÃO DO TERRAFORM
+                  # PASSO 3: EXECUÇÃO DO TERRAFORM (Plan/Apply)
                   # ---------------------------------------------------------
-                  echo -e "${color}▶️ ${label} Iniciando Terraform $action...${NC}"
-
-                  cd "$path"
-                  
-                  terraform init -reconfigure -input=false
+                  echo -e "${color}▶️ ${label} Executando Terraform $action...${NC}"
 
                   if [ "$action" == "plan" ]; then
                     terraform plan -input=false
@@ -170,6 +183,7 @@ jobs:
           echo "🔑 Configurando Backend Profile (AWS S3/DynamoDB)..."
           
           # Chama a função auth_aws importada de aws.sh para o Backend
+          # Isso cria o profile 'backend' no arquivo ~/.aws/credentials
           auth_aws "{\"role_arn\": \"$BACKEND_ROLE\", \"region\": \"$BACKEND_REGION\"}" "backend"
 
           # ---------------------------------------------------------
