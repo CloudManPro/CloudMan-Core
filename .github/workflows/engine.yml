@@ -27,21 +27,39 @@ jobs:
           fetch-depth: 2
 
       # INICIO DA MODIFICAÇÃO
+      - name: 🧐 Analyze Manifest Requirements
+        id: manifest_check
+        shell: bash
+        run: |
+          # Encontra o manifesto
+          MANIFEST_PATH=$(find . -name "manifest.json" -not -path "*/.*" | head -n 1)
+          
+          if [ -z "$MANIFEST_PATH" ]; then
+            echo "⚠️ Nenhum manifesto encontrado."
+            echo "needs_private_access=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Lógica: Se external_repositories for um array E tiver tamanho > 0, precisamos do token
+          NEEDS_ACCESS=$(jq -r 'if (.external_repositories | type == "array") and (.external_repositories | length > 0) then "true" else "false" end' "$MANIFEST_PATH")
+          
+          echo "📊 Status dos repositórios externos: $NEEDS_ACCESS"
+          echo "needs_private_access=$NEEDS_ACCESS" >> $GITHUB_OUTPUT
+
       - name: 🔑 CloudMan Auth Bridge
         id: gatekeeper
+        # Só executa se o passo anterior detectou repositórios externos
+        if: steps.manifest_check.outputs.needs_private_access == 'true'
         run: |
-          # 1. Obtém o ID Token (OIDC) do GitHub
+          echo "🔄 Iniciando troca de token OIDC..."
           ID_TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "$ACTIONS_ID_TOKEN_REQUEST_URL&aud=https://github.com/cloudmandev" | jq -r '.value')
           
-          # 2. Troca na Lambda por um Token de Instalação Real
-          # IMPORTANTE: Substitua a URL abaixo pela URL real da sua Lambda
           RESPONSE=$(curl -s -X POST https://dev.callback.cloudman.pro/cb/CallBack-dev \
             -d "{\"action\": \"exchange_oidc_for_token\", \"params\": {\"oidc_token\": \"$ID_TOKEN\", \"github_repo\": \"CloudManPro/cloudman-core\"}}")
           
           TOKEN=$(echo $RESPONSE | jq -r .token)
           
-          # Verificação de segurança
           if [ "$TOKEN" == "null" ] || [ -z "$TOKEN" ]; then
             echo "❌ Falha na autenticação: $RESPONSE"
             exit 1
@@ -49,17 +67,16 @@ jobs:
 
           echo "token=$TOKEN" >> $GITHUB_OUTPUT
 
-      # FIM DA MODIFICAÇÃO
-
       - name: 📥 Checkout CloudMan Engine
         uses: actions/checkout@v4
         with:
           repository: CloudManPro/cloudman-core
           path: .cloudman-engine
           ref: main
-          # Usa o token gerado acima para clonar o engine privado
-          token: ${{ steps.gatekeeper.outputs.token }}
-
+          # LÓGICA CRÍTICA:
+          # Se o gatekeeper rodou, usa o token dele.
+          # Se pulou, usa o GITHUB_TOKEN padrão (funciona se a Engine for pública ou interna à org)
+          token: ${{ steps.gatekeeper.outputs.token || secrets.GITHUB_TOKEN }}
 
       - name: 🛠️ Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -67,10 +84,8 @@ jobs:
       - name: 🚀 Executar Pipeline Modular
         shell: bash
         env:
-          # INICIO DA MODIFICAÇÃO
-          # Agora usamos o token com poderes de admin gerado pela Lambda
-          GH_CLONE_TOKEN: ${{ steps.gatekeeper.outputs.token }} 
-          # FIM DA MODIFICAÇÃO
+          # Mesma lógica de fallback aqui para o clone dentro do script
+          GH_CLONE_TOKEN: ${{ steps.gatekeeper.outputs.token || secrets.GITHUB_TOKEN }}
           LOGIN_REGION: ${{ inputs.default_region || 'us-east-1' }}
           SECRETS_CONTEXT: ${{ toJSON(secrets) }}
         run: |
