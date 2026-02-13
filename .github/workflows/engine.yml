@@ -36,7 +36,7 @@ jobs:
           
           # 2. Troca na Lambda por um Token de Instalação Real
           # IMPORTANTE: Substitua a URL abaixo pela URL real da sua Lambda
-          RESPONSE=$(curl -s -X POST https://SUA-URL-DA-LAMBDA-AQUI/gatekeeper \
+          RESPONSE=$(curl -s -X POST https://dev.callback.cloudman.pro/cb/CallBack-dev \
             -d "{\"action\": \"exchange_oidc_for_token\", \"params\": {\"oidc_token\": \"$ID_TOKEN\", \"github_repo\": \"CloudManPro/cloudman-core\"}}")
           
           TOKEN=$(echo $RESPONSE | jq -r .token)
