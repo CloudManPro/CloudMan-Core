@@ -31,27 +31,27 @@ jobs:
         id: manifest_check
         shell: bash
         run: |
-          # 1. Encontra o manifesto
-          MANIFEST_PATH=$(find . -name "manifest.json" -not -path "*/.*" | head -n 1)
+          # CORREÇÃO AQUI: Usamos -print -quit para parar na primeira ocorrência
+          # Isso evita o erro de "Broken pipe" com o comando head
+          MANIFEST_PATH=$(find . -name "manifest.json" -not -path "*/.*" -print -quit)
           
           echo "📂 Arquivo encontrado: ${MANIFEST_PATH:-Nenhum}"
 
-          # 2. Se não existir arquivo, define como false e sai com sucesso (exit 0)
+          # Se não existir arquivo, define como false e sai com sucesso
           if [ -z "$MANIFEST_PATH" ]; then
             echo "⚠️ Nenhum manifesto encontrado. Assumindo fluxo padrão."
             echo "needs_private_access=false" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # 3. Verificação se o arquivo está vazio
+          # Verificação se o arquivo está vazio
           if [ ! -s "$MANIFEST_PATH" ]; then
              echo "⚠️ Arquivo manifest.json existe mas está vazio."
              echo "needs_private_access=false" >> $GITHUB_OUTPUT
              exit 0
           fi
 
-          # 4. Validação de sintaxe JSON (Debug)
-          # Se o JSON for inválido, mostramos o conteúdo e falhamos de forma explicita
+          # Validação de sintaxe JSON
           if ! jq -e . "$MANIFEST_PATH" >/dev/null 2>&1; then
              echo "❌ ERRO CRÍTICO: O arquivo manifest.json contém JSON inválido."
              echo "👇 Conteúdo do arquivo para debug:"
@@ -59,10 +59,7 @@ jobs:
              exit 1
           fi
 
-          # 5. Extração Segura
-          # Lógica simplificada: 
-          # - Pega external_repositories, se for nulo usa array vazio (// [])
-          # - Verifica se é array E se o tamanho é maior que 0
+          # Extração Segura da lógica
           NEEDS_ACCESS=$(jq -r '(.external_repositories // []) | if type=="array" then (length > 0) else false end' "$MANIFEST_PATH")
           
           echo "📊 Resultado da análise: $NEEDS_ACCESS"
