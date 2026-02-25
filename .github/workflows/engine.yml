@@ -31,39 +31,44 @@ jobs:
         id: manifest_check
         shell: bash
         run: |
-          # CORREÇÃO AQUI: Usamos -print -quit para parar na primeira ocorrência
-          # Isso evita o erro de "Broken pipe" com o comando head
-          MANIFEST_PATH=$(find . -name "manifest.json" -not -path "*/.*" -print -quit)
+          echo "🔍 Identificando qual pasta disparou o pipeline..."
           
-          echo "📂 Arquivo encontrado: ${MANIFEST_PATH:-Nenhum}"
+          # 1. Tenta achar o manifesto na pasta que teve o código alterado
+          MANIFEST_PATH=$(git diff --name-only HEAD^ HEAD 2>/dev/null | grep "manifest.json" | head -n 1 || true)
+          
+          # 2. Se for trigger manual ou não achar diff, pega o primeiro que encontrar (fallback)
+          if [ -z "$MANIFEST_PATH" ] || [ ! -f "$MANIFEST_PATH" ]; then
+            MANIFEST_PATH=$(find . -name "manifest.json" -not -path "*/.*" -print -quit)
+          fi
+          
+          echo "========================================================="
+          echo "📂 [LOG DE CAMINHO] MANIFESTO SELECIONADO NA ANÁLISE:"
+          echo "Caminho: ${MANIFEST_PATH:-Nenhum encontrado}"
+          echo "========================================================="
 
-          # Se não existir arquivo, define como false e sai com sucesso
           if [ -z "$MANIFEST_PATH" ]; then
-            echo "⚠️ Nenhum manifesto encontrado. Assumindo fluxo padrão."
+            echo "⚠️ Nenhum manifesto encontrado. Assumindo fluxo padrão (false)."
             echo "needs_private_access=false" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # Verificação se o arquivo está vazio
           if [ ! -s "$MANIFEST_PATH" ]; then
              echo "⚠️ Arquivo manifest.json existe mas está vazio."
              echo "needs_private_access=false" >> $GITHUB_OUTPUT
              exit 0
           fi
 
-          # Validação de sintaxe JSON
           if ! jq -e . "$MANIFEST_PATH" >/dev/null 2>&1; then
-             echo "❌ ERRO CRÍTICO: O arquivo manifest.json contém JSON inválido."
-             echo "👇 Conteúdo do arquivo para debug:"
-             cat "$MANIFEST_PATH"
+             echo "❌ ERRO CRÍTICO: O arquivo $MANIFEST_PATH contém JSON inválido."
              exit 1
           fi
 
-          # Extração Segura da lógica
           NEEDS_ACCESS=$(jq -r '(.external_repositories // []) | if type=="array" then (length > 0) else false end' "$MANIFEST_PATH")
+          echo "📊 Resultado da análise Gatekeeper: $NEEDS_ACCESS"
           
-          echo "📊 Resultado da análise: $NEEDS_ACCESS"
+          # SALVANDO NA MEMÓRIA PARA O RESTO DO PIPELINE
           echo "needs_private_access=$NEEDS_ACCESS" >> $GITHUB_OUTPUT
+          echo "manifest_path=$MANIFEST_PATH" >> $GITHUB_OUTPUT
 
       - name: 🔑 CloudMan Auth Bridge
         id: gatekeeper
@@ -251,16 +256,19 @@ jobs:
           # MAIN
           # ==============================================================================
           
-          echo "🔍 Buscando manifest.json..."
-          MANIFEST_PATH=$(git diff --name-only HEAD^ HEAD | grep "manifest.json" | head -n 1)
-          if [ -z "$MANIFEST_PATH" ]; then
-            MANIFEST_PATH=$(find . -name "manifest.json" -not -path "*/.*" | head -n 1)
-          fi
-          if [ -z "$MANIFEST_PATH" ]; then
-            echo "❌ Erro: Nenhum manifest.json encontrado."
+          # RESGATANDO O CAMINHO SALVO NA MEMÓRIA DO PASSO 1
+          MANIFEST_PATH="${{ steps.manifest_check.outputs.manifest_path }}"
+          
+          # LOG CLARO PARA DEPURAÇÃO
+          echo "========================================================="
+          echo "📂 [LOG DE CAMINHO] MANIFESTO RECUPERADO PARA EXECUÇÃO:"
+          echo "Caminho: $MANIFEST_PATH"
+          echo "========================================================="
+
+          if [ -z "$MANIFEST_PATH" ] || [ ! -f "$MANIFEST_PATH" ]; then
+            echo "❌ Erro Crítico: Caminho do manifest.json foi perdido entre os steps ou o arquivo sumiu."
             exit 1
           fi
-          echo "✅ Manifesto carregado: $MANIFEST_PATH"
 
           ACTION=$(jq -r '.action // "apply"' "$MANIFEST_PATH")
           
