@@ -102,23 +102,50 @@ jobs:
 
       - name: 🔑 CloudMan Auth Bridge
         id: gatekeeper
-        # Só executa se o passo anterior detectou repositórios externos
         if: steps.manifest_check.outputs.needs_private_access == 'true'
+        shell: bash
         run: |
-          echo "🔄 Iniciando troca de token OIDC..."
+          # 1. Roteamento Dinâmico (Dev vs Prod) baseado na branch
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            STAGE="prod"
+            GATEKEEPER_URL="https://prod.v2.cloudman.pro/st/GithubGateKeeper-prod"
+            AUDIENCE="https://github.com/cloudmanpro"
+          else
+            STAGE="dev"
+            GATEKEEPER_URL="https://dev.v2.cloudman.pro/st/GithubGateKeeper-dev"
+            AUDIENCE="https://github.com/cloudmandev"
+          fi
+
+          echo "🚀 Detectado ambiente: $STAGE"
+          echo "🔗 Acionando Gatekeeper em: $GATEKEEPER_URL"
+
+          # 2. Pega o token OIDC do GitHub usando a audiência dinâmica
           ID_TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&aud=https://github.com/cloudmandev" | jq -r '.value')
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&aud=$AUDIENCE" | jq -r '.value')
           
-          RESPONSE=$(curl -s -X POST https://dev.callback.cloudman.pro/cb/CallBack-dev \
-            -d "{\"action\": \"exchange_oidc_for_token\", \"params\": {\"oidc_token\": \"$ID_TOKEN\", \"github_repo\": \"CloudManPro/cloudman-core\"}}")
+          # 3. Faz a chamada POST para o API Gateway correto
+          # Nota: O header Content-Type é obrigatório aqui!
+          # E passei o github_repo de forma dinâmica também: ${{ github.repository }}
+          RESPONSE=$(curl -s -X POST "$GATEKEEPER_URL" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"action\": \"exchange_oidc_for_token\", 
+              \"params\": {
+                \"oidc_token\": \"$ID_TOKEN\", 
+                \"github_repo\": \"${{ github.repository }}\"
+              }
+            }")
           
+          # 4. Extrai o token do JSON de resposta
           TOKEN=$(echo $RESPONSE | jq -r .token)
           
           if [ "$TOKEN" == "null" ] || [ -z "$TOKEN" ]; then
-            echo "❌ Falha na autenticação: $RESPONSE"
+            echo "❌ Falha na autenticação ($STAGE). Resposta do AWS API Gateway: $RESPONSE"
             exit 1
           fi
 
+          # 5. Salva o token em segredo para os próximos steps usarem
+          echo "✅ Autenticação bem-sucedida no ambiente $STAGE!"
           echo "token=$TOKEN" >> $GITHUB_OUTPUT
 
       - name: 📥 Checkout CloudMan Engine
