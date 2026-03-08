@@ -3,30 +3,41 @@ name: "CloudMan Engine: Lambda Sync"
 on:
   workflow_call:
     inputs:
+      # 1. Parâmetros de Operação
       direction:
         type: string
         description: "push (AWS->Git), pull (Git->AWS) or create"
         required: true
       region:
         type: string
+        description: "Default AWS Region"
         default: "us-east-1"
       role_arn:
         type: string
+        description: "IAM Role to Assume via OIDC"
         required: true
       resources_json:
         type: string
         description: "JSON Array of resources to sync"
         required: true
+
+      # 2. Parâmetros do Repositório Alvo (Onde o código da Lambda vive)
       target_repo:
         type: string
+        description: "Target Repository (Org/Repo)"
         required: true
       target_branch:
         type: string
+        description: "Target Branch"
         default: "main"
+
+      # 3. Autenticação Automatizada (GitHub App Token)
       git_token:
         type: string
+        description: "App Token passed from caller"
         required: true
 
+  # Permite disparo manual diretamente no repositório Core se necessário
   workflow_dispatch:
     inputs:
       direction: { required: true }
@@ -38,28 +49,32 @@ on:
       git_token: { required: true }
 
 permissions:
-  id-token: write
-  contents: write
+  id-token: write   # Autenticação AWS
+  contents: write   # Git Push
 
 jobs:
   sync-engine:
     runs-on: ubuntu-latest
     steps:
       - name: 🛡️ Mask Token
+        # Segurança: Oculta o token dos logs
         run: echo "::add-mask::${{ inputs.git_token }}"
 
+      # 1. BAIXAR OS SCRIPTS DO ENGINE (Onde estão orchestrator.js, push.js, etc)
       - name: 📥 Checkout Engine Scripts
         uses: actions/checkout@v4
         with:
+          repository: CloudManPro/CloudMan-Core
           path: '.engine'
 
+      # 2. BAIXAR O REPOSITÓRIO DO CLIENTE (Onde as pastas das Lambdas estão)
       - name: 📥 Checkout Target Repository
         uses: actions/checkout@v4
         with:
           repository: ${{ inputs.target_repo }}
           ref: ${{ inputs.target_branch }}
           token: ${{ inputs.git_token }}
-          path: '.'
+          path: '.' # Baixa na raiz para que os scripts encontrem os caminhos 'folder_path'
 
       - name: 🔑 Configure AWS Credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -68,23 +83,29 @@ jobs:
           aws-region: ${{ inputs.region }}
           role-session-name: CloudManSyncSession
 
+      # 3. EXECUTAR O ORQUESTRADOR
       - name: ⚡ Process Resources (Smart Engine)
         env:
           INPUT_DIRECTION: ${{ inputs.direction }}
           INPUT_RESOURCES: ${{ inputs.resources_json }}
           INPUT_REGION: ${{ inputs.region }}
+        # Agora o caminho .engine/scripts/aws_lambda_function/orchestrator.js existirá
         run: node .engine/scripts/aws_lambda_function/orchestrator.js
 
-      - name: 📝 Commit Changes (Push/Create Only)
+      # 4. COMMITAR MUDANÇAS (Apenas se for PUSH ou CREATE)
+      - name: 📝 Commit Changes
         if: inputs.direction == 'push' || inputs.direction == 'create'
         run: |
           git config user.name "CloudMan Bot"
           git config user.email "bot@cloudman.pro"
+          
+          # Adiciona apenas as mudanças no código do cliente, ignorando a pasta .engine
           git add .
+          
           if ! git diff --staged --quiet; then
             git commit -m "cloudman(sync): Sync code from Cloud [skip ci]"
             git push
-            echo "✅ Changes pushed successfully."
+            echo "✅ Changes pushed successfully to ${{ inputs.target_repo }}."
           else
             echo "✅ No changes to commit."
           fi
