@@ -3,13 +3,29 @@ name: "CloudMan Engine: Lambda Sync"
 on:
   workflow_call:
     inputs:
-      direction: { type: string, required: true }
-      region: { type: string, default: "us-east-1" }
-      role_arn: { type: string, required: true }
-      resources_json: { type: string, required: true }
-      target_repo: { type: string, required: true }
-      target_branch: { type: string, default: "main" }
-      git_token: { type: string, required: true }
+      direction:
+        type: string
+        description: "push (AWS->Git), pull (Git->AWS) or create"
+        required: true
+      region:
+        type: string
+        default: "us-east-1"
+      role_arn:
+        type: string
+        required: true
+      resources_json:
+        type: string
+        description: "JSON Array of resources to sync"
+        required: true
+      target_repo:
+        type: string
+        required: true
+      target_branch:
+        type: string
+        default: "main"
+      git_token:
+        type: string
+        required: true
 
   workflow_dispatch:
     inputs:
@@ -32,14 +48,11 @@ jobs:
       - name: 🛡️ Mask Token
         run: echo "::add-mask::${{ inputs.git_token }}"
 
-      # 1. Baixa ESTE repositório (CloudMan Engine) para a pasta '.engine'
-      # Isso traz a sua nova pasta /scripts/ para a máquina
       - name: 📥 Checkout Engine Scripts
         uses: actions/checkout@v4
         with:
           path: '.engine'
 
-      # 2. Baixa o repositório do cliente para a raiz ('.')
       - name: 📥 Checkout Target Repository
         uses: actions/checkout@v4
         with:
@@ -55,22 +68,19 @@ jobs:
           aws-region: ${{ inputs.region }}
           role-session-name: CloudManSyncSession
 
-      # 3. Roda o script Node nativamente chamando o orquestrador
       - name: ⚡ Process Resources (Smart Engine)
         env:
           INPUT_DIRECTION: ${{ inputs.direction }}
           INPUT_RESOURCES: ${{ inputs.resources_json }}
           INPUT_REGION: ${{ inputs.region }}
-        run: node .engine/scripts/orchestrator.js
+        run: node .engine/scripts/aws_lambda_function/orchestrator.js
 
       - name: 📝 Commit Changes (Push/Create Only)
         if: inputs.direction == 'push' || inputs.direction == 'create'
         run: |
           git config user.name "CloudMan Bot"
           git config user.email "bot@cloudman.pro"
-          
           git add .
-          
           if ! git diff --staged --quiet; then
             git commit -m "cloudman(sync): Sync code from Cloud [skip ci]"
             git push
