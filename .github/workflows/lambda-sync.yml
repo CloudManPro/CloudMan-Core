@@ -1,83 +1,52 @@
-#.github/workflows/lambda-sync.yml
 name: "CloudMan Engine: Lambda Sync"
 
 on:
-  # Permite ser chamado por workflows de outros repositórios
   workflow_call:
     inputs:
-      # 1. Parâmetros de Operação
-      direction:
-        type: string
-        description: "push (AWS->Git), pull (Git->AWS) or create"
-        required: true
-      region:
-        type: string
-        description: "Default AWS Region"
-        default: "us-east-1"
-      role_arn:
-        type: string
-        description: "IAM Role to Assume via OIDC"
-        required: true
-      resources_json:
-        type: string
-        description: "JSON Array of resources to sync"
-        required: true
+      direction: { type: string, required: true }
+      region: { type: string, default: "us-east-1" }
+      role_arn: { type: string, required: true }
+      resources_json: { type: string, required: true }
+      target_repo: { type: string, required: true }
+      target_branch: { type: string, default: "main" }
+      git_token: { type: string, required: true }
 
-      # 2. Parâmetros do Repositório Alvo
-      target_repo:
-        type: string
-        description: "Target Repository (Org/Repo)"
-        required: true
-      target_branch:
-        type: string
-        description: "Target Branch"
-        default: "main"
-
-      # 3. Autenticação Automatizada (GitHub App Token)
-      git_token:
-        type: string
-        description: "App Token passed from backend/listener"
-        required: true
-
-  # Permite disparo manual
   workflow_dispatch:
     inputs:
-      direction:
-        description: "push, pull or create"
-        required: true
-      region:
-        default: "us-east-1"
-      role_arn:
-        required: true
-      resources_json:
-        required: true
-      target_repo:
-        required: true
-      target_branch:
-        default: "main"
-      git_token:
-        required: true
+      direction: { required: true }
+      region: { default: "us-east-1" }
+      role_arn: { required: true }
+      resources_json: { required: true }
+      target_repo: { required: true }
+      target_branch: { default: "main" }
+      git_token: { required: true }
 
 permissions:
-  id-token: write   # Autenticação AWS
-  contents: write   # Git Push
+  id-token: write
+  contents: write
 
 jobs:
   sync-engine:
     runs-on: ubuntu-latest
     steps:
       - name: 🛡️ Mask Token
-        # Segurança: Oculta o token dos logs
         run: echo "::add-mask::${{ inputs.git_token }}"
 
+      # 1. Baixa ESTE repositório (CloudMan Engine) para a pasta '.engine'
+      # Isso traz a sua nova pasta /scripts/ para a máquina
+      - name: 📥 Checkout Engine Scripts
+        uses: actions/checkout@v4
+        with:
+          path: '.engine'
+
+      # 2. Baixa o repositório do cliente para a raiz ('.')
       - name: 📥 Checkout Target Repository
         uses: actions/checkout@v4
         with:
-          # Baixa o repositório do cliente
           repository: ${{ inputs.target_repo }}
           ref: ${{ inputs.target_branch }}
-          # Usa o token da App para permitir o push
           token: ${{ inputs.git_token }}
+          path: '.'
 
       - name: 🔑 Configure AWS Credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -86,154 +55,13 @@ jobs:
           aws-region: ${{ inputs.region }}
           role-session-name: CloudManSyncSession
 
+      # 3. Roda o script Node nativamente chamando o orquestrador
       - name: ⚡ Process Resources (Smart Engine)
-        id: processor
-        uses: actions/github-script@v7
         env:
           INPUT_DIRECTION: ${{ inputs.direction }}
           INPUT_RESOURCES: ${{ inputs.resources_json }}
-        with:
-          script: |
-            const fs = require('fs');
-            const path = require('path');
-            const { execSync } = require('child_process');
-
-            // --- HELPER: DETECT RUNTIME & BOILERPLATE ---
-            // Agora recebe o 'baseName' para usar no nome do arquivo
-            function getBoilerplate(runtime, baseName) {
-                const r = (runtime || '').toLowerCase();
-
-                // 1. Python (python3.9, python3.11, etc.)
-                if (r.includes('python')) {
-                    return [{
-                        filename: `${baseName}.py`, // Ex: MinhaFuncao.py
-                        content: `import json\n\ndef lambda_handler(event, context):\n    # TODO: Implement your logic here\n    return {\n        'statusCode': 200,\n        'body': json.dumps('Hello from CloudMan (Python)!')\n    }`
-                    }];
-                }
-
-                // 2. Node.js (nodejs18.x, nodejs20.x, etc.)
-                if (r.includes('node') || r.includes('js')) {
-                    return [{
-                        filename: `${baseName}.js`, // Ex: MinhaFuncao.js
-                        content: `exports.handler = async (event) => {\n    // TODO: Implement your logic here\n    const response = {\n        statusCode: 200,\n        body: JSON.stringify('Hello from CloudMan (Node.js)!'),\n    };\n    return response;\n};`
-                    }];
-                }
-
-                // 3. Ruby (ruby3.2, ruby3.3, etc.)
-                if (r.includes('ruby')) {
-                    return [
-                        {
-                            filename: `${baseName}.rb`, // Ex: MinhaFuncao.rb
-                            content: `require 'json'\n\ndef lambda_handler(event:, context:)\n    { statusCode: 200, body: JSON.generate('Hello from CloudMan (Ruby)!') }\nend`
-                        },
-                        {
-                            filename: 'Gemfile',
-                            content: `source 'https://rubygems.org'\n\n# gem 'aws-sdk-s3'`
-                        }
-                    ];
-                }
-
-                // Caso não seja um desses 3, retorna NULL para ser ignorado
-                return null;
-            }
-
-            // --- HELPER: SHELL EXECUTION ---
-            function run(cmd) {
-              try {
-                execSync(cmd, { stdio: 'inherit' }); 
-              } catch (e) {
-                console.error(`❌ Command failed: ${cmd}`);
-                throw e;
-              }
-            }
-
-            // --- MAIN LOGIC ---
-            const direction = process.env.INPUT_DIRECTION;
-            let resources = [];
-            
-            try {
-                resources = JSON.parse(process.env.INPUT_RESOURCES);
-            } catch (e) {
-                console.error("❌ Failed to parse resources_json.");
-                throw e;
-            }
-
-            console.log(`🚀 Starting ${direction.toUpperCase()} for ${resources.length} resources...`);
-
-            for (const res of resources) {
-                const funcId = res.function_arn || res.id; 
-                const folder = res.folder_path || res.git_path;
-                const region = res.region || '${{ inputs.region }}';
-                const runtime = (res.runtime || '').trim();
-
-                console.log(`\n---------------------------------------------------`);
-                console.log(`📦 Resource: ${funcId}`);
-                console.log(`📂 Folder: ${folder}`);
-                console.log(`⚙️ Runtime: ${runtime || 'Unknown'}`);
-
-                // --- CREATE (BOILERPLATE) ---
-                if (direction === 'create') {
-                    console.log('✨ Checking boilerplate support...');
-
-                    if (fs.existsSync(folder)) {
-                        console.log(`Folder '${folder}' already exists. Skipping.`);
-                        continue;
-                    }
-                    
-                    // Extrai o nome da pasta final para usar como nome do arquivo
-                    // Ex: 'LambdaFiles/MinhaFuncao' -> 'MinhaFuncao'
-                    const baseName = path.basename(folder);
-
-                    // Passa o baseName para a função geradora
-                    const templates = getBoilerplate(runtime, baseName);
-
-                    if (!templates) {
-                        console.warn(`⚠️ Skipped: Runtime '${runtime}' is not supported for editable boilerplate.`);
-                        continue;
-                    }
-                    
-                    run(`mkdir -p "${folder}"`);
-
-                    // Cria os arquivos definidos no template
-                    for (const tmpl of templates) {
-                        const filePath = path.join(folder, tmpl.filename);
-                        fs.writeFileSync(filePath, tmpl.content);
-                        console.log(`✅ Created ${tmpl.filename}`);
-                    }
-
-                // --- PUSH (CLOUD -> GIT) ---
-                } else if (direction === 'push') {
-                    console.log('🔽 Downloading code from AWS...');
-                    
-                    const getUrlCmd = `aws lambda get-function --function-name "${funcId}" --query 'Code.Location' --output text --region ${region}`;
-                    const url = execSync(getUrlCmd).toString().trim();
-
-                    if (!url || url === 'None') {
-                        throw new Error(`Could not get code URL for ${funcId}. Check if function exists.`);
-                    }
-
-                    run(`mkdir -p temp_lambda_dl`);
-                    run(`curl -sL "${url}" -o lambda_dl.zip`);
-                    run(`unzip -o -q lambda_dl.zip -d temp_lambda_dl`);
-                    run(`mkdir -p "${folder}"`);
-                    run(`rsync -av --delete --exclude '.git' temp_lambda_dl/ "${folder}/"`);
-                    run(`rm -rf temp_lambda_dl lambda_dl.zip`);
-
-                // --- PULL (GIT -> CLOUD) ---
-                } else if (direction === 'pull') {
-                    console.log('🔼 Uploading code to AWS...');
-                    
-                    if (!fs.existsSync(folder)) {
-                         console.warn(`⚠️ Folder '${folder}' does not exist in repo. Skipping.`);
-                         continue;
-                    }
-
-                    const zipName = `deploy_${Date.now()}.zip`;
-                    run(`cd "${folder}" && zip -r -X -q "../../${zipName}" .`);
-                    run(`aws lambda update-function-code --function-name "${funcId}" --zip-file fileb://${zipName} --region ${region} --publish`);
-                    run(`rm ${zipName}`);
-                }
-            }
+          INPUT_REGION: ${{ inputs.region }}
+        run: node .engine/scripts/orchestrator.js
 
       - name: 📝 Commit Changes (Push/Create Only)
         if: inputs.direction == 'push' || inputs.direction == 'create'
@@ -245,7 +73,6 @@ jobs:
           
           if ! git diff --staged --quiet; then
             git commit -m "cloudman(sync): Sync code from Cloud [skip ci]"
-            # O push é permitido graças ao token no step de checkout
             git push
             echo "✅ Changes pushed successfully."
           else
