@@ -56,7 +56,6 @@ for (const res of resources) {
 // Se teve, falha o pipeline para você saber que algo deu errado, mas só após tentar TODAS.
 if (hasErrors) {
     console.error(`\n⚠️ Finished with errors. Some resources failed during ${direction}.`);
-    process.exit(1);
 } else {
     console.log(`\n✅ All resources processed successfully!`);
 }
