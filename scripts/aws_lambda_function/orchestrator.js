@@ -15,8 +15,10 @@ try {
 
 console.log(`🚀 Starting ${direction.toUpperCase()} for ${resources.length} resources...`);
 
+// 1. Variável para rastrear se houve erros em alguma lambda
+let hasErrors = false; 
+
 for (const res of resources) {
-    // Padronizando o objeto de recurso para facilitar para os módulos
     const resourceData = {
         funcId: res.function_arn || res.id,
         folder: res.folder_path || res.git_path,
@@ -44,7 +46,17 @@ for (const res of resources) {
                 throw new Error(`Unknown direction: ${direction}`);
         }
     } catch (error) {
+        // 2. Apenas loga o erro e marca que houve problema, mas NÃO da process.exit(1) aqui!
         console.error(`❌ Failed to process ${resourceData.funcId}:`, error.message);
-        process.exit(1); // Para o workflow se houver erro
+        hasErrors = true; 
     }
+}
+
+// 3. No final de tudo, verifica se teve erro. 
+// Se teve, falha o pipeline para você saber que algo deu errado, mas só após tentar TODAS.
+if (hasErrors) {
+    console.error(`\n⚠️ Finished with errors. Some resources failed during ${direction}.`);
+    process.exit(1);
+} else {
+    console.log(`\n✅ All resources processed successfully!`);
 }
