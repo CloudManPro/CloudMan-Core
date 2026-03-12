@@ -296,9 +296,36 @@ jobs:
                     terraform apply -auto-approve -input=false
                   elif [ "$action" == "destroy" ]; then
                     terraform destroy -auto-approve -input=false
+                    DESTROY_STATUS=$? # Captura o status do destroy
+
+                    # Se o destroy foi um sucesso (exit code 0), prossegue para deletar o state remoto e local
+                    if [ $DESTROY_STATUS -eq 0 ]; then
+                        echo -e "${color}▶️ ${label} Destroy bem-sucedido. Removendo arquivo de state (TF_STATE) do S3...${NC}"
+                        
+                        # 1. Descobrir dinamicamente o Bucket e Key do S3 lendo o cache do Terraform
+                        if [ -f ".terraform/terraform.tfstate" ]; then
+                            BACKEND_TYPE=$(jq -r '.backend.type // empty' .terraform/terraform.tfstate)
+                            
+                            if [ "$BACKEND_TYPE" == "s3" ]; then
+                                S3_BUCKET=$(jq -r '.backend.config.bucket // empty' .terraform/terraform.tfstate)
+                                S3_KEY=$(jq -r '.backend.config.key // empty' .terraform/terraform.tfstate)
+                                
+                                if [ -n "$S3_BUCKET" ] && [ -n "$S3_KEY" ]; then
+                                    echo -e "${color}🗑️ ${label} Deletando remote state: s3://${S3_BUCKET}/${S3_KEY}${NC}"
+                                    aws s3 rm "s3://${S3_BUCKET}/${S3_KEY}" --profile backend || echo "⚠️ Aviso: Falha ao deletar arquivo no S3. Pode já ter sido excluído."
+                                fi
+                            fi
+                        fi
+
+                        # 2. Limpar arquivos locais
+                        echo -e "${color}🧹 ${label} Removendo cache local do Terraform...${NC}"
+                        rm -rf .terraform terraform.tfstate terraform.tfstate.backup .terraform.lock.hcl
+                    else
+                        echo -e "${color}❌ ${label} Falha no Terraform Destroy. O State remoto NÃO foi deletado.${NC}"
+                        return $DESTROY_STATUS
+                    fi
                   fi
               )
-
               return $?
           }
 
