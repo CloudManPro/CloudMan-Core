@@ -291,23 +291,21 @@ jobs:
                   elif [ "$action" == "apply" ]; then
                     terraform apply -auto-approve -input=false
                   
-                  # INÍCIO DA NOVA LÓGICA DE IMPORT
+                  # INÍCIO DA NOVA LÓGICA DE IMPORT (GERAÇÃO PARA REVISÃO)
                   elif [ "$action" == "import" ]; then
                     echo -e "${color}📥 ${label} Gerando código HCL a partir dos blocos de import...${NC}"
                     
-                    # 1. Limpa arquivo gerado anteriormente (se existir) para evitar conflitos
+                    # 1. Limpa arquivo gerado anteriormente (se existir)
                     rm -f generated_resources.tf
                     
-                    # 2. Gera o código Terraform (HCL) baseado no arquivo de imports
+                    # 2. Executa apenas o PLAN para gerar o arquivo. 
+                    # O State NÃO será atualizado no S3 neste momento.
                     terraform plan -generate-config-out=generated_resources.tf -input=false
                     
-                    echo -e "${color}💾 ${label} Aplicando import para salvar o State no S3...${NC}"
-                    # 3. O apply consolida o import e envia automaticamente o tfstate para o bucket S3
-                    terraform apply -auto-approve -input=false
+                    echo -e "${color}⏳ ${label} PLAN finalizado. Arquivo gerado para revisão pelo Front-end.${NC}"
                     
-                    # 4. Cria uma flag temporária para avisar o Github Actions que precisamos commitar algo
+                    # 3. Cria a flag para o Github Actions commitar e devolver pro Front-end
                     touch "$GITHUB_WORKSPACE/.needs_commit"
-                  # FIM DA LÓGICA DE IMPORT
 
                   elif [ "$action" == "destroy" ]; then
 
@@ -475,10 +473,10 @@ jobs:
             if git diff --staged --quiet; then
               echo "Nenhuma mudança nova para commitar."
             else
-              # IMPORTANTE: A tag [skip ci] evita que esse commit dispare o workflow novamente (loop infinito)
-              git commit -m "feat: código terraform gerado via import dinâmico [skip ci]"
+              # IMPORTANTE: A tag [skip ci] evita que esse commit dispare o workflow novamente
+              git commit -m "chore: código terraform gerado aguardando revisão do CloudMan [skip ci]"
               git push
-              echo "✅ Código enviado para o repositório com sucesso!"
+              echo "✅ Código enviado para o repositório. Aguardando Front-end limpar e disparar o Apply!
             fi
           else
             echo "Nenhuma operação de import realizada nesta execução."
