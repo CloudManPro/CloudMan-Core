@@ -299,8 +299,9 @@ jobs:
                     rm -f generated_resources.tf
                     
                     # 2. Executa apenas o PLAN para gerar o arquivo. 
-                    # O State NÃO será atualizado no S3 neste momento.
-                    terraform plan -generate-config-out=generated_resources.tf -input=false
+                    # O "|| true" é OBRIGATÓRIO AQUI! O Terraform vai gerar o arquivo sujo
+                    # e falhar na validação. O "|| true" diz para o bash ignorar o erro e seguir.
+                    terraform plan -generate-config-out=generated_resources.tf -input=false || true
                     
                     echo -e "${color}⏳ ${label} PLAN finalizado. Arquivo gerado para revisão pelo Front-end.${NC}"
                     
@@ -476,7 +477,7 @@ jobs:
               # IMPORTANTE: A tag [skip ci] evita que esse commit dispare o workflow novamente
               git commit -m "chore: código terraform gerado aguardando revisão do CloudMan [skip ci]"
               git push
-              echo "✅ Código enviado para o repositório. Aguardando Front-end limpar e disparar o Apply!
+              echo "✅ Código enviado para o repositório. Aguardando Front-end limpar e disparar o Apply!"
             fi
           else
             echo "Nenhuma operação de import realizada nesta execução."
