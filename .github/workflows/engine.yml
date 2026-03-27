@@ -295,14 +295,24 @@ jobs:
                   elif [ "$action" == "import" ]; then
                     echo -e "${color}📥 ${label} Gerando plano de importação em JSON...${NC}"
                     
-                    # 1. Gera o código HCL para revisão humana
-                    terraform plan -generate-config-out=generated_resources.tf -out=import.tfplan -input=false || true
+                    # 1. Limpeza preventiva para garantir que o Terraform consiga escrever os novos arquivos
+                    rm -f generated_resources.tf import.tfplan generated_resources.json
                     
-                    # 2. Converte o arquivo de plano (.tfplan) para JSON (amigável para o Front-end)
-                    terraform show -json import.tfplan > generated_resources.json || true
+                    # 2. Tenta gerar o código HCL e o plano binário
+                    # Removido o '|| true' para que possamos validar o resultado
+                    terraform plan -generate-config-out=generated_resources.tf -out=import.tfplan -input=false
                     
-                    echo -e "${color}⏳ ${label} Arquivos gerados para revisão.${NC}"
-                    touch "$GITHUB_WORKSPACE/.needs_commit"
+                    # 3. Valida se o plano foi realmente gerado
+                    if [ -f "import.tfplan" ]; then
+                        echo -e "${color}📄 Convertendo plano para JSON...${NC}"
+                        terraform show -json import.tfplan > generated_resources.json
+                        
+                        echo -e "${color}⏳ ${label} Arquivos gerados com sucesso para revisão.${NC}"
+                        touch "$GITHUB_WORKSPACE/.needs_commit"
+                    else
+                        echo -e "${RED}❌ Erro Crítico: Falha ao gerar o arquivo de plano (import.tfplan).${NC}"
+                        exit 1
+                    fi
 
                   elif [ "$action" == "destroy" ]; then
 
