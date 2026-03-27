@@ -293,19 +293,15 @@ jobs:
                   
                   # INÍCIO DA NOVA LÓGICA DE IMPORT (GERAÇÃO PARA REVISÃO)
                   elif [ "$action" == "import" ]; then
-                    echo -e "${color}📥 ${label} Gerando código HCL a partir dos blocos de import...${NC}"
+                    echo -e "${color}📥 ${label} Gerando plano de importação em JSON...${NC}"
                     
-                    # 1. Limpa arquivo gerado anteriormente (se existir)
-                    rm -f generated_resources.tf
+                    # 1. Gera o código HCL para revisão humana
+                    terraform plan -generate-config-out=generated_resources.tf -out=import.tfplan -input=false || true
                     
-                    # 2. Executa apenas o PLAN para gerar o arquivo. 
-                    # O "|| true" é OBRIGATÓRIO AQUI! O Terraform vai gerar o arquivo sujo
-                    # e falhar na validação. O "|| true" diz para o bash ignorar o erro e seguir.
-                    terraform plan -generate-config-out=generated_resources.tf -input=false || true
+                    # 2. Converte o arquivo de plano (.tfplan) para JSON (amigável para o Front-end)
+                    terraform show -json import.tfplan > generated_resources.json || true
                     
-                    echo -e "${color}⏳ ${label} PLAN finalizado. Arquivo gerado para revisão pelo Front-end.${NC}"
-                    
-                    # 3. Cria a flag para o Github Actions commitar e devolver pro Front-end
+                    echo -e "${color}⏳ ${label} Arquivos gerados para revisão.${NC}"
                     touch "$GITHUB_WORKSPACE/.needs_commit"
 
                   elif [ "$action" == "destroy" ]; then
@@ -468,7 +464,7 @@ jobs:
             git config --global user.email "github-actions[bot]@users.noreply.github.com"
             
             # Adiciona apenas os arquivos gerados pelo Terraform
-            git add ./**/generated_resources.tf
+            git add ./**/generated_resources.json
             
             # Checa se há algo para commitar
             if git diff --staged --quiet; then
