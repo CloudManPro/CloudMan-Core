@@ -303,7 +303,23 @@ jobs:
                     terraform plan -input=false
                   
                   elif [ "$action" == "apply" ]; then
+                    echo -e "${color}▶️ ${label} Executando Terraform apply...${NC}"
                     terraform apply -auto-approve -input=false
+                    APPLY_STATUS=$?
+
+                    # SE O APPLY FOI UM SUCESSO, DELETA OS ARQUIVOS DE IMPORTAÇÃO
+                    if [ $APPLY_STATUS -eq 0 ]; then
+                        echo -e "${color}🧹 ${label} Apply bem-sucedido. Removendo import.tf e JSON residuais...${NC}"
+                        
+                        # Remove os arquivos do diretório atual
+                        rm -f import.tf generated_resources.json generated_resources.tf import.tfplan
+                        
+                        # Cria uma flag para o último step do pipeline saber que precisa fazer o commit da exclusão
+                        touch "$GITHUB_WORKSPACE/.needs_cleanup"
+                    else
+                        echo -e "${RED}❌ ${label} Falha no Apply. Arquivos mantidos para depuração.${NC}"
+                        return $APPLY_STATUS
+                    fi
                   
                   # INÍCIO DA NOVA LÓGICA DE IMPORT (GERAÇÃO PARA REVISÃO)
                   elif [ "$action" == "import" ]; then
@@ -483,31 +499,40 @@ jobs:
               echo "::endgroup::"
           done
           
-      - name: 💾 Push Terraform Gerado (Import)
+      - name: 💾 Push / Cleanup GitOps State
         if: success()
         shell: bash
         run: |
-          # Verifica se a flag foi criada durante o step anterior
+          # Configura o bot do Github
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # 1. LÓGICA DO PASSO 2 (GERAÇÃO DE IMPORT)
           if [ -f "$GITHUB_WORKSPACE/.needs_commit" ]; then
             echo "📥 Operação de import detectada. Salvando recursos gerados no repositório..."
-            
-            # Configura o bot do Github
-            git config --global user.name "github-actions[bot]"
-            git config --global user.email "github-actions[bot]@users.noreply.github.com"
-            
-            # Adiciona apenas os arquivos gerados pelo Terraform
             git add ./**/generated_resources.json
             
-            # Checa se há algo para commitar
-            if git diff --staged --quiet; then
-              echo "Nenhuma mudança nova para commitar."
-            else
-              # IMPORTANTE: A tag [skip ci] evita que esse commit dispare o workflow novamente
+            if ! git diff --staged --quiet; then
               git commit -m "chore: código terraform gerado aguardando revisão do CloudMan [skip ci]"
               git push
-              echo "✅ Código enviado para o repositório. Aguardando Front-end limpar e disparar o Apply!"
+              echo "✅ Código de importação enviado para o repositório."
             fi
-          else
-            echo "Nenhuma operação de import realizada nesta execução."
           fi
+
+          # 2. LÓGICA DO PASSO 4 (LIMPEZA PÓS-APPLY)
+          if [ -f "$GITHUB_WORKSPACE/.needs_cleanup" ]; then
+            echo "🧹 Operação de apply finalizada. Removendo arquivos de importação do repositório..."
+            
+            # O parâmetro -u no git add pega arquivos que foram deletados
+            git add -u ./**/import.tf ./**/generated_resources.json ./**/generated_resources.tf 2>/dev/null || true
+            
+            if ! git diff --staged --quiet; then
+              git commit -m "chore: cleanup import.tf and json after successful apply [skip ci]"
+              git push
+              echo "✅ Arquivos residuais excluídos do repositório com sucesso!"
+            else
+              echo "Nenhum arquivo residual para limpar no Git."
+            fi
+          fi
+          
           echo "✅ Pipeline finalizado."
