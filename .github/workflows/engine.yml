@@ -344,15 +344,31 @@ jobs:
                     DESTROY_STATUS=$? # Captura o status do destroy
 
                     if [ $DESTROY_STATUS -eq 0 ]; then
-                        echo -e "${color}▶️ ${label} Destroy bem-sucedido. Removendo state remoto do S3...${NC}"
+                        echo -e "${color}▶️ ${label} Destroy bem-sucedido. Iniciando limpeza do Backend Remoto...${NC}"
                         
-                        # Extrai a Key EXATA (caminho + nome do arquivo) que o Terraform está usando
+                        # Extrai a Key EXATA e a Tabela do DynamoDB que o Terraform está usando
                         if [ -f ".terraform/terraform.tfstate" ]; then
                             S3_EXACT_KEY=$(jq -r '.backend.config.key // empty' .terraform/terraform.tfstate)
+                            DYNAMODB_TABLE=$(jq -r '.backend.config.dynamodb_table // empty' .terraform/terraform.tfstate)
                             
                             if [ -n "$BACKEND_BUCKET" ] && [ -n "$S3_EXACT_KEY" ]; then
+                                # 1. REMOVE DO S3 (Para a lógica de HEAD request do CloudMan funcionar)
                                 echo -e "${color}🗑️ ${label} Deletando arquivo: s3://${BACKEND_BUCKET}/${S3_EXACT_KEY}${NC}"
                                 aws s3 rm "s3://${BACKEND_BUCKET}/${S3_EXACT_KEY}" --profile backend || echo "⚠️ Aviso: Falha ao deletar arquivo no S3."
+                                
+                                # 2. REMOVE DO DYNAMODB (Para o Terraform não quebrar no próximo Apply)
+                                if [ -n "$DYNAMODB_TABLE" ] && [ "$DYNAMODB_TABLE" != "null" ]; then
+                                    echo -e "${color}🔓 ${label} Removendo Lock do DynamoDB (Tabela: ${DYNAMODB_TABLE})...${NC}"
+                                    
+                                    # O padrão de LockID do Terraform no S3 é sempre: <bucket>/<key>-md5
+                                    LOCK_ID="${BACKEND_BUCKET}/${S3_EXACT_KEY}-md5"
+                                    
+                                    aws dynamodb delete-item \
+                                        --table-name "$DYNAMODB_TABLE" \
+                                        --key "{\"LockID\": {\"S\": \"$LOCK_ID\"}}" \
+                                        --region "$BACKEND_REGION" \
+                                        --profile backend || echo "⚠️ Aviso: Falha ao deletar item no DynamoDB ou item já inexistente."
+                                fi
                             else
                                 echo -e "${color}⚠️ ${label} Bucket ou Key não encontrados. State remoto mantido.${NC}"
                             fi
@@ -360,11 +376,11 @@ jobs:
                              echo -e "${color}⚠️ ${label} Arquivo de cache do Terraform ausente. State remoto mantido.${NC}"
                         fi
 
-                        # 2. Limpar arquivos locais
+                        # 3. Limpar arquivos locais
                         echo -e "${color}🧹 ${label} Removendo cache local do Terraform...${NC}"
                         rm -rf .terraform terraform.tfstate terraform.tfstate.backup .terraform.lock.hcl
                     else
-                        echo -e "${color}❌ ${label} Falha no Terraform Destroy. O State remoto NÃO foi deletado.${NC}"
+                        echo -e "${color}❌ ${label} Falha no Terraform Destroy. A limpeza remota NÃO foi executada.${NC}"
                         return $DESTROY_STATUS
                     fi
                   fi
