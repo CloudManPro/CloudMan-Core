@@ -17,7 +17,7 @@ function auth_aws() {
       --role-arn "$role_arn" \
       --role-session-name "$session_name" \
       --web-identity-token "$jwt" \
-      --duration-seconds 900 \
+      --duration-seconds 3600 \
       --region "$region" \
       --output json)
 
